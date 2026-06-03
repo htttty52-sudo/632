@@ -212,3 +212,124 @@ async def test_dedup_prevents_duplicates_on_reconnect():
                 break
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_consecutive_short_disconnects_no_duplicates():
+    """Two rapid disconnects in a row: verify no duplicate messages reach the output.
+
+    Simulates:
+    1. Client connects, receives messages seq 0-4
+    2. Server drops connection (disconnect #1)
+    3. Client reconnects, receives messages seq 5-9
+    4. Server drops again immediately (disconnect #2)
+    5. Server resets counter, replays from seq 0
+    6. Client reconnects - dedup must catch all replayed sequences
+    """
+    server = MockExchangeServer()
+    await server.start()
+
+    dedup = MessageDeduplicator(window_size=200, max_time_delta_ms=5000)
+    forwarded: list[str] = []
+
+    try:
+        client = TestableClient(server.url)
+
+        # Phase 1: receive initial messages
+        count = 0
+        try:
+            async for msg in client.connect_and_stream():
+                if not dedup.is_duplicate(msg.msg_id):
+                    forwarded.append(msg.msg_id)
+                count += 1
+                if count >= 5:
+                    await server.force_disconnect_all()
+                    await asyncio.sleep(0.05)
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError):
+            pass
+
+        phase1_count = len(forwarded)
+        assert phase1_count == 5
+
+        # Phase 2: reconnect, receive more, then disconnect again quickly
+        await asyncio.sleep(0.1)
+        server._should_disconnect = False
+        count = 0
+        try:
+            async for msg in client.connect_and_stream():
+                if not dedup.is_duplicate(msg.msg_id):
+                    forwarded.append(msg.msg_id)
+                count += 1
+                if count >= 5:
+                    await server.force_disconnect_all()
+                    await asyncio.sleep(0.05)
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError):
+            pass
+
+        phase2_count = len(forwarded) - phase1_count
+        assert phase2_count == 5
+
+        # Phase 3: server resets sequence counter (simulates replay from start)
+        server._send_count = 0
+        server._should_disconnect = False
+        await asyncio.sleep(0.1)
+
+        count = 0
+        duplicates_caught = 0
+        async for msg in client.connect_and_stream():
+            if dedup.is_duplicate(msg.msg_id):
+                duplicates_caught += 1
+            else:
+                forwarded.append(msg.msg_id)
+            count += 1
+            if count >= 10:
+                break
+
+        # All replayed messages (seq 0-9) should be caught as duplicates
+        # since they were already forwarded in phase 1 and 2
+        assert duplicates_caught == 10, (
+            f"Expected 10 duplicates caught but got {duplicates_caught}. "
+            f"Total forwarded: {len(forwarded)}"
+        )
+        # No new messages should have been forwarded in phase 3
+        assert len(forwarded) == phase1_count + phase2_count
+
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_rapid_reconnect_subscription_only_once():
+    """Verify that during reconnect, subscription is sent only once per connection."""
+    server = MockExchangeServer()
+    await server.start()
+
+    subscribe_calls: list[float] = []
+
+    class TrackingClient(TestableClient):
+        async def _send_subscriptions(self, ws) -> None:
+            subscribe_calls.append(asyncio.get_event_loop().time())
+
+    try:
+        client = TrackingClient(server.url)
+
+        # First connection
+        count = 0
+        async for msg in client.connect_and_stream():
+            count += 1
+            if count >= 3:
+                break
+
+        assert len(subscribe_calls) == 1
+
+        # Second connection (after break)
+        count = 0
+        async for msg in client.connect_and_stream():
+            count += 1
+            if count >= 3:
+                break
+
+        assert len(subscribe_calls) == 2
+
+    finally:
+        await server.stop()

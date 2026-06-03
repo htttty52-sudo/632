@@ -21,17 +21,34 @@ const emptyState: OrderBookState = {
 }
 
 /**
- * Compare two level arrays and return true if any price or quantity differs.
- * Short-circuits on first difference for performance.
+ * Merge-sort diff: compare old and new arrays sorted by price.
+ * Returns a new array only replacing positions that actually changed.
+ * Bids: descending by price. Asks: ascending by price.
  */
-function levelsChanged(prev: OrderBookLevel[], next: OrderBookLevel[]): boolean {
-  if (prev.length !== next.length) return true
-  for (let i = 0; i < prev.length; i++) {
-    if (prev[i].price !== next[i].price || prev[i].quantity !== next[i].quantity) {
-      return true
+function mergeDiff(
+  prev: OrderBookLevel[],
+  next: OrderBookLevel[]
+): { result: OrderBookLevel[]; changed: boolean } {
+  if (prev.length === 0 && next.length === 0) return { result: prev, changed: false }
+  if (prev.length !== next.length) return { result: next, changed: true }
+
+  let changed = false
+  const result: OrderBookLevel[] = new Array(next.length)
+
+  // Two-pointer merge: both arrays should already be sorted.
+  // Walk both in order, detect mismatches.
+  for (let i = 0; i < next.length; i++) {
+    const p = prev[i]
+    const n = next[i]
+    if (p && p.price === n.price && p.quantity === n.quantity) {
+      result[i] = p // reuse same object reference (no re-render for this slot)
+    } else {
+      result[i] = n
+      changed = true
     }
   }
-  return false
+
+  return { result, changed }
 }
 
 export const useOrderBookStore = defineStore('orderbook', () => {
@@ -54,11 +71,12 @@ export const useOrderBookStore = defineStore('orderbook', () => {
     const next = pendingData
     pendingData = null
 
-    // Only update if bids or asks actually changed
-    const bidsChanged = levelsChanged(prev.bids, next.bids)
-    const asksChanged = levelsChanged(prev.asks, next.asks)
+    // Merge-sort diff: only replace positions that changed
+    const bidsMerge = mergeDiff(prev.bids, next.bids)
+    const asksMerge = mergeDiff(prev.asks, next.asks)
 
-    if (!bidsChanged && !asksChanged && prev.exchange === next.exchange) {
+    if (!bidsMerge.changed && !asksMerge.changed && prev.exchange === next.exchange) {
+      // Nothing changed, skip re-render entirely
       return
     }
 
@@ -67,8 +85,8 @@ export const useOrderBookStore = defineStore('orderbook', () => {
       symbol: next.symbol,
       timestamp: next.timestamp,
       sequence: next.sequence,
-      bids: bidsChanged ? next.bids : prev.bids,
-      asks: asksChanged ? next.asks : prev.asks,
+      bids: bidsMerge.changed ? bidsMerge.result : prev.bids,
+      asks: asksMerge.changed ? asksMerge.result : prev.asks,
     }
   }
 

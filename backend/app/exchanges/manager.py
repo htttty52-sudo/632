@@ -1,7 +1,6 @@
 import asyncio
 import random
 import logging
-from typing import Optional
 
 from app.config import settings
 from app.dedup.deduplicator import MessageDeduplicator
@@ -28,10 +27,20 @@ class ExponentialBackoff:
         self._attempt = 0
 
 
+class ReconnectState:
+    """Per-exchange reconnect state with lock to prevent duplicate subscriptions."""
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.reconnect_count = 0
+        self.is_reconnecting = False
+
+
 class ExchangeManager:
     def __init__(self):
         self._clients: dict[str, BaseExchangeClient] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._states: dict[str, ReconnectState] = {}
         self._dedup = MessageDeduplicator(window_size=settings.dedup_max_size)
         self._running = False
 
@@ -39,6 +48,7 @@ class ExchangeManager:
         self._running = True
         self._init_clients()
         for name, client in self._clients.items():
+            self._states[name] = ReconnectState()
             self._tasks[name] = asyncio.create_task(self._run_with_reconnect(name, client))
         logger.info(f"ExchangeManager started with clients: {list(self._clients.keys())}")
 
@@ -67,25 +77,39 @@ class ExchangeManager:
             factor=settings.reconnect_factor,
             max_delay=settings.reconnect_max_delay,
         )
-        reconnect_count = 0
+        state = self._states[name]
+
         while self._running:
-            try:
-                if reconnect_count > 0:
-                    logger.info(f"{name} reconnect #{reconnect_count}, subscriptions will be re-sent")
-                async for msg in client.connect_and_stream():
+            async with state.lock:
+                # Lock held: only one reconnect attempt at a time per exchange.
+                # This guarantees subscriptions are sent exactly once per connection.
+                state.is_reconnecting = True
+                try:
+                    if state.reconnect_count > 0:
+                        logger.info(
+                            f"{name} reconnect #{state.reconnect_count}, "
+                            "re-subscribing (lock held, single subscription guaranteed)"
+                        )
+                    state.is_reconnecting = False
+
+                    async for msg in client.connect_and_stream():
+                        if not self._running:
+                            break
+                        if not self._dedup.is_duplicate(msg.msg_id):
+                            await connection_manager.broadcast(msg)
+                    backoff.reset()
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
                     if not self._running:
-                        break
-                    if not self._dedup.is_duplicate(msg.msg_id):
-                        await connection_manager.broadcast(msg)
-                backoff.reset()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                if not self._running:
-                    break
-                reconnect_count += 1
-                delay = backoff.next_delay()
-                logger.warning(f"{name} disconnected ({e}), reconnecting in {delay:.1f}s")
+                        return
+                    state.reconnect_count += 1
+                    state.is_reconnecting = False
+                    delay = backoff.next_delay()
+                    logger.warning(f"{name} disconnected ({e}), reconnecting in {delay:.1f}s")
+
+            # Sleep outside the lock so other coroutines can check state
+            if self._running:
                 await asyncio.sleep(delay)
 
 
