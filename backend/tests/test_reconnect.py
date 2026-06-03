@@ -70,12 +70,16 @@ class TestableClient(BaseExchangeClient):
     async def connect_and_stream(self):
         async with websockets.connect(self._url) as ws:
             self._connected = True
+            await self._send_subscriptions(ws)
             try:
                 async for raw_msg in ws:
                     data = json.loads(raw_msg)
                     yield self.parse_depth(data)
             finally:
                 self._connected = False
+
+    async def _send_subscriptions(self, ws) -> None:
+        pass
 
     def parse_depth(self, raw: dict) -> UnifiedOrderBook:
         return UnifiedOrderBook(
@@ -178,7 +182,7 @@ async def test_reconnect_after_disconnect():
 @pytest.mark.asyncio
 async def test_dedup_prevents_duplicates_on_reconnect():
     """After reconnection, duplicate message IDs should be filtered."""
-    dedup = MessageDeduplicator(ttl_seconds=5.0)
+    dedup = MessageDeduplicator(window_size=200)
     server = MockExchangeServer()
     await server.start()
 

@@ -16,21 +16,16 @@ class OKXClient(BaseExchangeClient):
     def __init__(self):
         super().__init__("okx")
         self._url = settings.okx_ws_url
+        self._subscriptions = [
+            {"channel": "books5", "instId": "BTC-USDT"},
+            {"channel": "trades", "instId": "BTC-USDT"},
+        ]
 
     async def connect_and_stream(self) -> AsyncIterator[MarketMessage]:
         async with websockets.connect(self._url) as ws:
             self._connected = True
-            logger.info("OKX WS connected")
-
-            subscribe_msg = json.dumps({
-                "op": "subscribe",
-                "args": [
-                    {"channel": "books5", "instId": "BTC-USDT"},
-                    {"channel": "trades", "instId": "BTC-USDT"},
-                ]
-            })
-            await ws.send(subscribe_msg)
-
+            logger.info("OKX WS connected, sending subscriptions")
+            await self._send_subscriptions(ws)
             try:
                 async for raw_msg in ws:
                     data = json.loads(raw_msg)
@@ -45,6 +40,14 @@ class OKXClient(BaseExchangeClient):
                             yield self.parse_trade(trade_data)
             finally:
                 self._connected = False
+
+    async def _send_subscriptions(self, ws) -> None:
+        subscribe_msg = json.dumps({
+            "op": "subscribe",
+            "args": self._subscriptions,
+        })
+        await ws.send(subscribe_msg)
+        logger.info(f"OKX subscribed to: {self._subscriptions}")
 
     def parse_depth(self, raw: dict) -> UnifiedOrderBook:
         book = raw["data"][0]

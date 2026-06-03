@@ -16,25 +16,40 @@ class BinanceClient(BaseExchangeClient):
     def __init__(self):
         super().__init__("binance")
         symbol = settings.symbols[0].replace("/", "").lower()
-        self._depth_url = f"{settings.binance_ws_url}/{symbol}@depth20@100ms"
-        self._trade_url = f"{settings.binance_ws_url}/{symbol}@trade"
+        self._symbol = symbol
+        self._base_url = settings.binance_ws_url
+        self._subscriptions = [
+            f"{symbol}@depth20@100ms",
+            f"{symbol}@trade",
+        ]
 
     async def connect_and_stream(self) -> AsyncIterator[MarketMessage]:
-        symbol = settings.symbols[0].replace("/", "").lower()
-        combined_url = f"{settings.binance_ws_url}/{symbol}@depth20@100ms/{symbol}@trade"
-
-        async with websockets.connect(combined_url) as ws:
+        url = f"{self._base_url}/stream"
+        async with websockets.connect(url) as ws:
             self._connected = True
-            logger.info("Binance WS connected")
+            logger.info("Binance WS connected, sending subscriptions")
+            await self._send_subscriptions(ws)
             try:
                 async for raw_msg in ws:
                     data = json.loads(raw_msg)
-                    if "lastUpdateId" in data:
-                        yield self.parse_depth(data)
-                    elif "e" in data and data["e"] == "trade":
-                        yield self.parse_trade(data)
+                    if "result" in data:
+                        continue
+                    stream_data = data.get("data", data)
+                    if "lastUpdateId" in stream_data:
+                        yield self.parse_depth(stream_data)
+                    elif stream_data.get("e") == "trade":
+                        yield self.parse_trade(stream_data)
             finally:
                 self._connected = False
+
+    async def _send_subscriptions(self, ws) -> None:
+        subscribe_msg = json.dumps({
+            "method": "SUBSCRIBE",
+            "params": self._subscriptions,
+            "id": 1,
+        })
+        await ws.send(subscribe_msg)
+        logger.info(f"Binance subscribed to: {self._subscriptions}")
 
     def parse_depth(self, raw: dict) -> UnifiedOrderBook:
         return UnifiedOrderBook(

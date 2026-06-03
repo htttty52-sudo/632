@@ -21,9 +21,12 @@ class MockClient(BaseExchangeClient):
         self._base_price = Decimal("67500.00")
         self._trade_id = 1000000
 
+    async def _send_subscriptions(self, ws) -> None:
+        pass
+
     async def connect_and_stream(self) -> AsyncIterator[MarketMessage]:
         self._connected = True
-        logger.info(f"Mock {self.name} WS started")
+        logger.info(f"Mock {self.name} WS started (subscriptions restored)")
         try:
             while True:
                 self._sequence += 1

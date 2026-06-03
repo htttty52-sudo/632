@@ -32,10 +32,7 @@ class ExchangeManager:
     def __init__(self):
         self._clients: dict[str, BaseExchangeClient] = {}
         self._tasks: dict[str, asyncio.Task] = {}
-        self._dedup = MessageDeduplicator(
-            ttl_seconds=settings.dedup_ttl_seconds,
-            max_size=settings.dedup_max_size,
-        )
+        self._dedup = MessageDeduplicator(window_size=settings.dedup_max_size)
         self._running = False
 
     async def start(self):
@@ -70,8 +67,11 @@ class ExchangeManager:
             factor=settings.reconnect_factor,
             max_delay=settings.reconnect_max_delay,
         )
+        reconnect_count = 0
         while self._running:
             try:
+                if reconnect_count > 0:
+                    logger.info(f"{name} reconnect #{reconnect_count}, subscriptions will be re-sent")
                 async for msg in client.connect_and_stream():
                     if not self._running:
                         break
@@ -83,6 +83,7 @@ class ExchangeManager:
             except Exception as e:
                 if not self._running:
                     break
+                reconnect_count += 1
                 delay = backoff.next_delay()
                 logger.warning(f"{name} disconnected ({e}), reconnecting in {delay:.1f}s")
                 await asyncio.sleep(delay)
