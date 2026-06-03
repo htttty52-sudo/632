@@ -3,6 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Node
+node_modules/
+dist/
+
+# SQLite
+*.db
+
 # C extensions
 *.so
 
