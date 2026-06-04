@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class SpreadEngine:
-    """Computes pairwise spread matrix and triggers alerts."""
+    """Computes pairwise spread matrix and triggers alerts with 30-min cooldown per pair."""
 
     def __init__(self, price_table: PriceTable):
         self._price_table = price_table
@@ -44,20 +44,21 @@ class SpreadEngine:
         while self._running:
             try:
                 await asyncio.sleep(self._interval)
-                matrix = await self._compute_matrix()
-                if matrix:
-                    await connection_manager.broadcast(matrix)
+                for symbol in settings.symbols:
+                    matrix = await self._compute_matrix(symbol)
+                    if matrix:
+                        await connection_manager.broadcast(matrix)
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 logger.error(f"SpreadEngine error: {e}")
 
-    async def _compute_matrix(self) -> SpreadMatrix | None:
-        valid = await self._price_table.get_valid_prices()
-        stale = await self._price_table.get_stale_exchanges()
+    async def _compute_matrix(self, symbol: str = "BTC/USDT") -> SpreadMatrix | None:
+        valid = await self._price_table.get_valid_prices(symbol)
+        stale = await self._price_table.get_stale_exchanges(symbol)
         if len(valid) < 2:
             return SpreadMatrix(
-                symbol="BTC/USDT",
+                symbol=symbol,
                 exchanges=sorted(valid.keys()),
                 cells=[],
                 stale_exchanges=stale,
@@ -89,19 +90,19 @@ class SpreadEngine:
 
                 if spread_pct > self._threshold_pct:
                     direction = "a_to_b" if spread_ab > spread_ba else "b_to_a"
-                    await self._trigger_alert(ex_a, ex_b, spread_pct, direction)
+                    await self._trigger_alert(symbol, ex_a, ex_b, spread_pct, direction)
 
         return SpreadMatrix(
-            symbol="BTC/USDT",
+            symbol=symbol,
             exchanges=exchanges,
             cells=cells,
             stale_exchanges=stale,
             timestamp=int(time.time() * 1000),
         )
 
-    async def _trigger_alert(self, exchange_a: str, exchange_b: str,
+    async def _trigger_alert(self, symbol: str, exchange_a: str, exchange_b: str,
                              spread_pct: Decimal, direction: str):
-        pair_key = f"{exchange_a}:{exchange_b}"
+        pair_key = f"{symbol}:{exchange_a}:{exchange_b}"
         now = time.time()
         last = self._last_alert_time.get(pair_key, 0)
         if now - last < self._cooldown_seconds:
@@ -111,7 +112,7 @@ class SpreadEngine:
         ts = int(now * 1000)
 
         alert_event = SpreadAlertEvent(
-            symbol="BTC/USDT",
+            symbol=symbol,
             exchange_a=exchange_a,
             exchange_b=exchange_b,
             spread_pct=spread_pct,
@@ -120,14 +121,14 @@ class SpreadEngine:
         )
         await connection_manager.broadcast(alert_event)
         logger.warning(
-            f"SPREAD ALERT: {exchange_a}/{exchange_b} spread={spread_pct:.4f}% "
-            f"direction={direction}"
+            f"SPREAD ALERT: {symbol} {exchange_a}/{exchange_b} spread={spread_pct:.4f}% "
+            f"direction={direction} (cooldown {self._cooldown_seconds}s)"
         )
 
         try:
             async with async_session() as session:
                 record = SpreadAlert(
-                    symbol="BTC/USDT",
+                    symbol=symbol,
                     exchange_a=exchange_a,
                     exchange_b=exchange_b,
                     spread_pct=float(spread_pct),

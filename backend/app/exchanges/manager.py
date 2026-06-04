@@ -47,7 +47,7 @@ class ExchangeManager:
         self._running = False
         self.price_table = PriceTable(
             stale_threshold_ms=settings.stale_threshold_ms,
-            clock_alpha=settings.clock_alpha,
+            clock_window_size=settings.clock_window_size,
         )
 
     async def start(self):

@@ -24,10 +24,10 @@ class Settings(BaseSettings):
     dedup_max_size: int = 10000
 
     stale_threshold_ms: float = 5000.0
-    clock_alpha: float = 0.1
+    clock_window_size: int = 20
     spread_broadcast_interval_ms: float = 500.0
     spread_alert_threshold_pct: float = 0.1
-    spread_alert_cooldown_seconds: float = 30.0
+    spread_alert_cooldown_seconds: float = 1800.0
 
     use_mock: bool = False
 
