@@ -10,3 +10,7 @@ aiosqlite>=0.19
 httpx>=0.26
 pytest>=8.0
 pytest-asyncio>=0.23
+influxdb-client[async]>=1.38
+pandas>=2.1
+numpy>=1.26
+numba>=0.59

@@ -8,6 +8,7 @@ from app.exchanges.base import BaseExchangeClient
 from app.models.market import UnifiedOrderBook
 from app.ws.broadcast import connection_manager
 from app.arbitrage.price_table import PriceTable
+from app.influxdb.writer import influx_writer
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,15 @@ class ExchangeManager:
                                     best_bid=msg.bids[0].price,
                                     best_ask=msg.asks[0].price,
                                     exchange_ts=msg.timestamp,
+                                )
+                                influx_writer.record_orderbook(
+                                    exchange=msg.exchange,
+                                    symbol=msg.symbol,
+                                    best_bid=msg.bids[0].price,
+                                    best_ask=msg.asks[0].price,
+                                    bid_depth=[(l.price, l.quantity) for l in msg.bids[:5]],
+                                    ask_depth=[(l.price, l.quantity) for l in msg.asks[:5]],
+                                    timestamp_ms=msg.timestamp,
                                 )
                                 if first_orderbook and state.reconnect_count > 0:
                                     first_orderbook = False

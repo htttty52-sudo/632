@@ -19,6 +19,11 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      path: '/backtest',
+      component: () => import('../views/BacktestPanel.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
       path: '/admin',
       component: () => import('../views/AdminConfig.vue'),
       meta: { requiresAuth: true },

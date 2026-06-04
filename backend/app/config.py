@@ -34,5 +34,17 @@ class Settings(BaseSettings):
 
     use_mock: bool = False
 
+    # Fee settings
+    maker_fee_rate: float = 0.001
+    taker_fee_rate: float = 0.001
+    slippage_spread_multiplier: float = 0.0005
+
+    # InfluxDB settings
+    influxdb_enabled: bool = False
+    influxdb_url: str = "http://localhost:8086"
+    influxdb_token: str = "my-super-secret-token"
+    influxdb_org: str = "crypto-arb"
+    influxdb_bucket: str = "market_data"
+
 
 settings = Settings()

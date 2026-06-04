@@ -1,3 +1,5 @@
+import asyncio
+import json
 import logging
 from typing import Union
 
@@ -15,10 +17,13 @@ MarketData = Union[UnifiedOrderBook, UnifiedTrade, SpreadSnapshot, SpreadMatrix,
 class ConnectionManager:
     def __init__(self):
         self._connections: set[WebSocket] = set()
+        self._peak_connections: int = 0
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self._connections.add(websocket)
+        if len(self._connections) > self._peak_connections:
+            self._peak_connections = len(self._connections)
         logger.info(f"Client connected, total: {len(self._connections)}")
 
     def disconnect(self, websocket: WebSocket):
@@ -41,32 +46,40 @@ class ConnectionManager:
             msg_type = "spread"
 
         payload = {"type": msg_type, "data": data.model_dump(mode="json")}
-        dead: list[WebSocket] = []
-
-        for ws in self._connections.copy():
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-
-        for ws in dead:
-            self._connections.discard(ws)
+        text = json.dumps(payload)
+        await self._send_to_all(text)
 
     async def broadcast_raw(self, payload: dict):
         if not self._connections:
             return
+        text = json.dumps(payload)
+        await self._send_to_all(text)
+
+    async def _send_to_all(self, text: str):
+        """Send pre-serialized text to all connections concurrently."""
         dead: list[WebSocket] = []
-        for ws in self._connections.copy():
+
+        async def _send(ws: WebSocket):
             try:
-                await ws.send_json(payload)
+                await ws.send_text(text)
             except Exception:
                 dead.append(ws)
+
+        await asyncio.gather(*[_send(ws) for ws in self._connections.copy()])
+
         for ws in dead:
             self._connections.discard(ws)
 
     @property
     def client_count(self) -> int:
         return len(self._connections)
+
+    @property
+    def metrics(self) -> dict:
+        return {
+            "connections": len(self._connections),
+            "peak_connections": self._peak_connections,
+        }
 
 
 connection_manager = ConnectionManager()

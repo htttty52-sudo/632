@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  influxdb:
+    image: influxdb:2.7
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: adminpassword
+      DOCKER_INFLUXDB_INIT_ORG: crypto-arb
+      DOCKER_INFLUXDB_INIT_BUCKET: market_data
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: my-super-secret-token
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      ARB_DATABASE_URL: "sqlite+aiosqlite:///./arbitrage.db"
+      ARB_JWT_SECRET: "production-secret-change-me"
+      ARB_USE_MOCK: "true"
+      ARB_INFLUXDB_ENABLED: "true"
+      ARB_INFLUXDB_URL: "http://influxdb:8086"
+      ARB_INFLUXDB_TOKEN: "my-super-secret-token"
+      ARB_INFLUXDB_ORG: "crypto-arb"
+      ARB_INFLUXDB_BUCKET: "market_data"
+      ARB_MAKER_FEE_RATE: "0.001"
+      ARB_TAKER_FEE_RATE: "0.001"
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  influxdb_data:

@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 
 from app.config import settings
 from app.arbitrage.price_table import PriceTable
+from app.core.trading import (
+    FeeConfig, evaluate_conditions, compute_trade_amount,
+    validate_trade, compute_pnl,
+)
 from app.db.database import async_session
 from app.models.strategy import Strategy, StrategyLog
 from app.ws.broadcast import connection_manager
@@ -13,14 +17,6 @@ from app.ws.broadcast import connection_manager
 from sqlalchemy import select, update
 
 logger = logging.getLogger(__name__)
-
-OPERATOR_MAP = {
-    ">": lambda a, b: a > b,
-    "<": lambda a, b: a < b,
-    ">=": lambda a, b: a >= b,
-    "<=": lambda a, b: a <= b,
-    "==": lambda a, b: a == b,
-}
 
 
 @dataclass
@@ -190,18 +186,7 @@ class StrategyEngine:
                 logger.error(f"Strategy scan error: {e}")
 
     def _evaluate_conditions(self, conditions: list[dict], ctx: dict) -> bool:
-        for cond in conditions:
-            field = cond.get("field", "")
-            operator = cond.get("operator", "")
-            threshold = cond.get("value", 0)
-            if field not in ctx:
-                return False
-            op_fn = OPERATOR_MAP.get(operator)
-            if not op_fn:
-                return False
-            if not op_fn(ctx[field], threshold):
-                return False
-        return True
+        return evaluate_conditions(conditions, ctx)
 
     # ─── Worker: lock → check → deduct-or-reject → persist ─────────────────
 
@@ -221,24 +206,27 @@ class StrategyEngine:
 
     async def _execute_trade(self, signal: TradeSignal):
         user_lock = self._user_funds.get(signal.user_id)
+        fee_config = FeeConfig(
+            maker_fee_rate=settings.maker_fee_rate,
+            taker_fee_rate=settings.taker_fee_rate,
+        )
 
         async with user_lock:
             strat = self._strategies.get(signal.strategy_id)
             if not strat:
                 return
 
-            trade_amount = strat.simulated_balance * self.SIMULATED_TRADE_FRACTION
+            trade_amount = compute_trade_amount(strat.simulated_balance, self.SIMULATED_TRADE_FRACTION)
 
-            if trade_amount < self.MIN_TRADE_AMOUNT:
+            if not validate_trade(trade_amount, self.MIN_TRADE_AMOUNT):
                 logger.info(
                     f"Strategy '{signal.strategy_name}' rejected: "
                     f"insufficient balance ({strat.simulated_balance:.2f})"
                 )
                 return
 
-            # Atomic deduct: lock held, compute pnl, update balance
-            simulated_pnl = trade_amount * (signal.spread_pct / 100.0)
-            new_balance = strat.simulated_balance - trade_amount + trade_amount + simulated_pnl
+            simulated_pnl = compute_pnl(signal.spread_pct, trade_amount, fee_config)
+            new_balance = strat.simulated_balance + simulated_pnl
             strat.simulated_balance = new_balance
             balance_after = new_balance
 
