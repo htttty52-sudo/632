@@ -9,13 +9,13 @@ from app.ws.broadcast import ConnectionManager
 
 class MockWebSocket:
     def __init__(self):
-        self.sent_messages: list[bytes] = []
+        self.sent_messages: list[bytearray] = []
         self.closed = False
 
     async def accept(self):
         pass
 
-    async def send_bytes(self, data: bytes):
+    async def send_bytes(self, data: bytes | bytearray):
         if self.closed:
             raise RuntimeError("Connection closed")
         self.sent_messages.append(data)
@@ -53,8 +53,8 @@ async def test_broadcast_500_connections():
 
 
 @pytest.mark.asyncio
-async def test_broadcast_single_serialization():
-    """Verify that all connections receive the exact same bytes (not re-encoded)."""
+async def test_broadcast_independent_buffers():
+    """Verify that each connection receives its own independent buffer copy."""
     manager = ConnectionManager()
     connections = [MockWebSocket() for _ in range(10)]
 
@@ -65,7 +65,10 @@ async def test_broadcast_single_serialization():
     await manager.broadcast_raw(payload)
 
     buffers = [ws.sent_messages[0] for ws in connections]
-    assert len(set(id(b) for b in buffers)) == 1 or all(b == buffers[0] for b in buffers)
+    # All buffers should have identical content
+    assert all(bytes(b) == bytes(buffers[0]) for b in buffers)
+    # Each should be a distinct object (independent copy, not shared memory)
+    assert len(set(id(b) for b in buffers)) == len(buffers)
 
 
 @pytest.mark.asyncio

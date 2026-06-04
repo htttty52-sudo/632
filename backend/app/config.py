@@ -50,3 +50,9 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def reload_settings() -> Settings:
+    """Force re-read config from env/.env file, bypassing module-level cache."""
+    return Settings()
+

@@ -14,28 +14,6 @@ logger = logging.getLogger(__name__)
 MarketData = Union[UnifiedOrderBook, UnifiedTrade, SpreadSnapshot, SpreadMatrix, SpreadAlertEvent]
 
 
-class SharedMessage:
-    """Reference-counted message buffer. Encode once, share across all connections."""
-
-    __slots__ = ('_data', '_refcount')
-
-    def __init__(self, data: bytes):
-        self._data = data
-        self._refcount = 0
-
-    def acquire(self, count: int = 1):
-        self._refcount += count
-
-    def release(self):
-        self._refcount -= 1
-        if self._refcount <= 0:
-            self._data = b''
-
-    @property
-    def data(self) -> bytes:
-        return self._data
-
-
 class ConnectionManager:
     def __init__(self):
         self._connections: set[WebSocket] = set()
@@ -78,20 +56,18 @@ class ConnectionManager:
         await self._send_to_all(raw)
 
     async def _send_to_all(self, data: bytes):
-        """Send pre-encoded bytes to all connections concurrently (copy-on-write: single buffer shared)."""
+        """Send an independent buffer copy to each connection — no shared writable memory."""
         dead: list[WebSocket] = []
-        msg = SharedMessage(data)
-        msg.acquire(len(self._connections))
 
-        async def _send(ws: WebSocket):
+        async def _send(ws: WebSocket, buf: bytes):
             try:
-                await ws.send_bytes(msg.data)
+                await ws.send_bytes(buf)
             except Exception:
                 dead.append(ws)
-            finally:
-                msg.release()
 
-        await asyncio.gather(*[_send(ws) for ws in self._connections.copy()])
+        await asyncio.gather(*[
+            _send(ws, bytearray(data)) for ws in self._connections.copy()
+        ])
 
         for ws in dead:
             self._connections.discard(ws)

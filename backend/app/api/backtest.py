@@ -5,7 +5,7 @@ from app.auth.dependencies import get_current_user
 from app.backtest.schemas import BacktestRequest, BacktestResult
 from app.backtest.engine import run_backtest
 from app.influxdb.query import query_available_ranges
-from app.config import settings
+from app.config import settings, reload_settings
 
 router = APIRouter()
 
@@ -17,7 +17,9 @@ async def run_backtest_endpoint(
     body: BacktestRequest,
     current_user=Depends(get_current_user),
 ):
-    if not settings.influxdb_enabled:
+    live_settings = reload_settings()
+
+    if not live_settings.influxdb_enabled:
         raise HTTPException(status_code=503, detail="Historical data service not available")
 
     duration = body.end_time - body.start_time
@@ -33,15 +35,15 @@ async def run_backtest_endpoint(
         raise HTTPException(status_code=400, detail="At least one condition is required")
 
     if "maker_fee_rate" not in body.model_fields_set:
-        body.maker_fee_rate = settings.maker_fee_rate
+        body.maker_fee_rate = live_settings.maker_fee_rate
     if "taker_fee_rate" not in body.model_fields_set:
-        body.taker_fee_rate = settings.taker_fee_rate
+        body.taker_fee_rate = live_settings.taker_fee_rate
     if "trade_fraction" not in body.model_fields_set:
-        body.trade_fraction = settings.trade_fraction
+        body.trade_fraction = live_settings.trade_fraction
     if "min_trade_amount" not in body.model_fields_set:
-        body.min_trade_amount = settings.min_trade_amount
+        body.min_trade_amount = live_settings.min_trade_amount
     if "slippage_multiplier" not in body.model_fields_set:
-        body.slippage_multiplier = settings.slippage_spread_multiplier
+        body.slippage_multiplier = live_settings.slippage_spread_multiplier
 
     allowed_fields = {"spread_pct", "best_spread", "volume"}
     allowed_ops = {">", "<", ">=", "<=", "=="}

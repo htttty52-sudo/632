@@ -178,7 +178,11 @@ def _precompute_slippage_from_depth(
     trade_fraction: float,
     initial_balance: float,
 ) -> np.ndarray:
-    """Pre-compute per-bar slippage_pct by calling compute_slippage_from_book."""
+    """Pre-compute per-bar slippage by replaying depth events in time order.
+
+    Walks depth change events sequentially, maintaining a running book state.
+    Each spread bar sees the accumulated book as of the last depth event before it.
+    """
     n = len(spread_df)
     slippage_pcts = np.zeros(n, dtype=np.float64)
 
@@ -186,32 +190,38 @@ def _precompute_slippage_from_depth(
         return slippage_pcts
 
     depth_df = depth_df.sort_values("timestamp").reset_index(drop=True)
-    depth_timestamps = depth_df["timestamp"].values
-
     estimate_amount = initial_balance * trade_fraction
 
+    # Running book state: 5 ask levels, updated as we replay events
+    current_ask_levels: list[tuple[float, float]] = []
+
+    depth_idx = 0
+    depth_len = len(depth_df)
+
     for i in range(n):
-        ts = spread_df["timestamp"].iloc[i]
-        idx = np.searchsorted(depth_timestamps, ts, side="right") - 1
-        if idx < 0:
-            idx = 0
+        bar_ts = spread_df["timestamp"].iloc[i]
 
-        row = depth_df.iloc[idx]
-        ask_levels: list[tuple[float, float]] = []
-        for lvl in range(5):
-            price_col = f"ask_{lvl}_price"
-            qty_col = f"ask_{lvl}_qty"
-            if price_col in row and qty_col in row:
-                p = row.get(price_col)
-                q = row.get(qty_col)
-                if p and q and float(p) > 0 and float(q) > 0:
-                    ask_levels.append((float(p), float(q)))
+        # Replay all depth events up to (and including) this bar's timestamp
+        while depth_idx < depth_len and depth_df["timestamp"].iloc[depth_idx] <= bar_ts:
+            row = depth_df.iloc[depth_idx]
+            new_levels: list[tuple[float, float]] = []
+            for lvl in range(5):
+                price_col = f"ask_{lvl}_price"
+                qty_col = f"ask_{lvl}_qty"
+                if price_col in row.index and qty_col in row.index:
+                    p = row[price_col]
+                    q = row[qty_col]
+                    if p is not None and q is not None:
+                        pf, qf = float(p), float(q)
+                        if pf > 0 and qf > 0:
+                            new_levels.append((pf, qf))
+            if new_levels:
+                current_ask_levels = new_levels
+            depth_idx += 1
 
-        if ask_levels:
-            result = compute_slippage_from_book(ask_levels, estimate_amount)
+        if current_ask_levels:
+            result = compute_slippage_from_book(current_ask_levels, estimate_amount)
             slippage_pcts[i] = result.slippage_pct / 100.0
-        else:
-            slippage_pcts[i] = 0.0
 
     return slippage_pcts
 

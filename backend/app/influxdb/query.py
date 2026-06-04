@@ -67,6 +67,7 @@ async def query_spread_data(
 
     df = pd.concat(chunks, ignore_index=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.drop_duplicates(subset=["timestamp"], keep="first")
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
@@ -128,6 +129,7 @@ async def query_orderbook_depth(
 
     df = pd.concat(chunks, ignore_index=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.drop_duplicates(subset=["timestamp"], keep="first")
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
