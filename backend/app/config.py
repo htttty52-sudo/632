@@ -34,9 +34,11 @@ class Settings(BaseSettings):
 
     use_mock: bool = False
 
-    # Fee settings
+    # Trading settings
     maker_fee_rate: float = 0.001
     taker_fee_rate: float = 0.001
+    min_trade_amount: float = 1.0
+    trade_fraction: float = 0.10
     slippage_spread_multiplier: float = 0.0005
 
     # InfluxDB settings

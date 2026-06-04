@@ -9,19 +9,16 @@ from app.ws.broadcast import ConnectionManager
 
 class MockWebSocket:
     def __init__(self):
-        self.sent_messages: list[str] = []
+        self.sent_messages: list[bytes] = []
         self.closed = False
 
     async def accept(self):
         pass
 
-    async def send_text(self, text: str):
+    async def send_bytes(self, data: bytes):
         if self.closed:
             raise RuntimeError("Connection closed")
-        self.sent_messages.append(text)
-
-    async def send_json(self, data):
-        await self.send_text(json.dumps(data))
+        self.sent_messages.append(data)
 
 
 @pytest.mark.asyncio
@@ -45,22 +42,19 @@ async def test_broadcast_500_connections():
 
     elapsed = time.perf_counter() - start
 
-    # All connections should have received all 100 messages
     for ws in connections:
         assert len(ws.sent_messages) == 100
 
-    # Verify message content
-    first_msg = json.loads(connections[0].sent_messages[0])
+    first_msg = json.loads(connections[0].sent_messages[0].decode('utf-8'))
     assert first_msg["type"] == "spread_matrix"
     assert first_msg["data"]["iteration"] == 0
 
-    # Should complete within reasonable time (< 5s for 500*100 = 50000 sends)
     assert elapsed < 5.0, f"Broadcast took {elapsed:.2f}s, expected < 5s"
 
 
 @pytest.mark.asyncio
 async def test_broadcast_single_serialization():
-    """Verify that all connections receive the exact same text (not re-serialized)."""
+    """Verify that all connections receive the exact same bytes (not re-encoded)."""
     manager = ConnectionManager()
     connections = [MockWebSocket() for _ in range(10)]
 
@@ -70,9 +64,8 @@ async def test_broadcast_single_serialization():
     payload = {"type": "test", "data": {"key": "value"}}
     await manager.broadcast_raw(payload)
 
-    # All should have received identical strings
-    texts = [ws.sent_messages[0] for ws in connections]
-    assert len(set(texts)) == 1
+    buffers = [ws.sent_messages[0] for ws in connections]
+    assert len(set(id(b) for b in buffers)) == 1 or all(b == buffers[0] for b in buffers)
 
 
 @pytest.mark.asyncio
@@ -105,9 +98,8 @@ async def test_peak_connections_tracking():
 
     assert manager.metrics["peak_connections"] == 50
 
-    # Disconnect half
     for ws in connections[:25]:
         manager.disconnect(ws)
 
     assert manager.metrics["connections"] == 25
-    assert manager.metrics["peak_connections"] == 50  # Peak should remain
+    assert manager.metrics["peak_connections"] == 50

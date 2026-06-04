@@ -32,6 +32,7 @@ export function useWebSocket(path: string, options: UseWebSocketOptions) {
 
     try {
       ws = new WebSocket(getUrl())
+      ws.binaryType = 'arraybuffer'
     } catch {
       scheduleReconnect()
       return
@@ -48,7 +49,10 @@ export function useWebSocket(path: string, options: UseWebSocketOptions) {
 
     ws.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data)
+        const text = typeof event.data === 'string'
+          ? event.data
+          : new TextDecoder().decode(event.data as ArrayBuffer)
+        const data = JSON.parse(text)
         options.onMessage(data)
       } catch {}
     }

@@ -14,6 +14,28 @@ logger = logging.getLogger(__name__)
 MarketData = Union[UnifiedOrderBook, UnifiedTrade, SpreadSnapshot, SpreadMatrix, SpreadAlertEvent]
 
 
+class SharedMessage:
+    """Reference-counted message buffer. Encode once, share across all connections."""
+
+    __slots__ = ('_data', '_refcount')
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self._refcount = 0
+
+    def acquire(self, count: int = 1):
+        self._refcount += count
+
+    def release(self):
+        self._refcount -= 1
+        if self._refcount <= 0:
+            self._data = b''
+
+    @property
+    def data(self) -> bytes:
+        return self._data
+
+
 class ConnectionManager:
     def __init__(self):
         self._connections: set[WebSocket] = set()
@@ -46,24 +68,28 @@ class ConnectionManager:
             msg_type = "spread"
 
         payload = {"type": msg_type, "data": data.model_dump(mode="json")}
-        text = json.dumps(payload)
-        await self._send_to_all(text)
+        raw = json.dumps(payload).encode('utf-8')
+        await self._send_to_all(raw)
 
     async def broadcast_raw(self, payload: dict):
         if not self._connections:
             return
-        text = json.dumps(payload)
-        await self._send_to_all(text)
+        raw = json.dumps(payload).encode('utf-8')
+        await self._send_to_all(raw)
 
-    async def _send_to_all(self, text: str):
-        """Send pre-serialized text to all connections concurrently."""
+    async def _send_to_all(self, data: bytes):
+        """Send pre-encoded bytes to all connections concurrently (copy-on-write: single buffer shared)."""
         dead: list[WebSocket] = []
+        msg = SharedMessage(data)
+        msg.acquire(len(self._connections))
 
         async def _send(ws: WebSocket):
             try:
-                await ws.send_text(text)
+                await ws.send_bytes(msg.data)
             except Exception:
                 dead.append(ws)
+            finally:
+                msg.release()
 
         await asyncio.gather(*[_send(ws) for ws in self._connections.copy()])
 

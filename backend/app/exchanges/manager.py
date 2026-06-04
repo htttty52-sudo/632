@@ -112,12 +112,16 @@ class ExchangeManager:
                         if not self._dedup.is_duplicate(msg.msg_id):
                             await connection_manager.broadcast(msg)
                             if isinstance(msg, UnifiedOrderBook) and msg.bids and msg.asks:
+                                bid_depth = [(l.price, l.quantity) for l in msg.bids[:5]]
+                                ask_depth = [(l.price, l.quantity) for l in msg.asks[:5]]
                                 await self.price_table.update(
                                     exchange=msg.exchange,
                                     symbol=msg.symbol,
                                     best_bid=msg.bids[0].price,
                                     best_ask=msg.asks[0].price,
                                     exchange_ts=msg.timestamp,
+                                    bid_depth=bid_depth,
+                                    ask_depth=ask_depth,
                                 )
                                 influx_writer.record_orderbook(
                                     exchange=msg.exchange,

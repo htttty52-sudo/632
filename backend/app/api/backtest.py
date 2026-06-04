@@ -32,6 +32,17 @@ async def run_backtest_endpoint(
     if not body.conditions:
         raise HTTPException(status_code=400, detail="At least one condition is required")
 
+    if "maker_fee_rate" not in body.model_fields_set:
+        body.maker_fee_rate = settings.maker_fee_rate
+    if "taker_fee_rate" not in body.model_fields_set:
+        body.taker_fee_rate = settings.taker_fee_rate
+    if "trade_fraction" not in body.model_fields_set:
+        body.trade_fraction = settings.trade_fraction
+    if "min_trade_amount" not in body.model_fields_set:
+        body.min_trade_amount = settings.min_trade_amount
+    if "slippage_multiplier" not in body.model_fields_set:
+        body.slippage_multiplier = settings.slippage_spread_multiplier
+
     allowed_fields = {"spread_pct", "best_spread", "volume"}
     allowed_ops = {">", "<", ">=", "<=", "=="}
     for cond in body.conditions:

@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -7,6 +7,8 @@ from app.config import settings
 from app.influxdb.client import get_influx_client
 
 logger = logging.getLogger(__name__)
+
+CHUNK_DAYS = 1
 
 
 async def query_spread_data(
@@ -16,48 +18,56 @@ async def query_spread_data(
     start_time: datetime,
     end_time: datetime,
 ) -> pd.DataFrame:
-    """Query spread snapshots from InfluxDB, returns DataFrame with columns:
-    timestamp, spread_pct, best_spread, mid_price, direction
-    """
+    """Query spread snapshots from InfluxDB in daily chunks, selecting only needed fields."""
     client = await get_influx_client()
     if not client:
         return pd.DataFrame()
 
-    query = f'''
-    from(bucket: "{settings.influxdb_bucket}")
-        |> range(start: {start_time.isoformat()}Z, stop: {end_time.isoformat()}Z)
-        |> filter(fn: (r) => r._measurement == "spread_snapshot")
-        |> filter(fn: (r) => r.symbol == "{symbol}")
-        |> filter(fn: (r) => r.exchange_a == "{exchange_a}" and r.exchange_b == "{exchange_b}")
-        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        |> sort(columns: ["_time"])
-    '''
+    chunks: list[pd.DataFrame] = []
+    chunk_start = start_time
 
-    try:
-        query_api = client.query_api()
-        tables = await query_api.query(query, org=settings.influxdb_org)
+    while chunk_start < end_time:
+        chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end_time)
 
-        records = []
-        for table in tables:
-            for record in table.records:
-                records.append({
-                    "timestamp": record.get_time(),
-                    "spread_pct": record.values.get("spread_pct", 0.0),
-                    "best_spread": record.values.get("best_spread", 0.0),
-                    "mid_price": record.values.get("mid_price", 0.0),
-                    "direction": record.values.get("direction", ""),
-                })
+        query = f'''
+        from(bucket: "{settings.influxdb_bucket}")
+            |> range(start: {chunk_start.isoformat()}Z, stop: {chunk_end.isoformat()}Z)
+            |> filter(fn: (r) => r._measurement == "spread_snapshot")
+            |> filter(fn: (r) => r.symbol == "{symbol}")
+            |> filter(fn: (r) => r.exchange_a == "{exchange_a}" and r.exchange_b == "{exchange_b}")
+            |> filter(fn: (r) => r._field == "spread_pct" or r._field == "best_spread")
+            |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+            |> sort(columns: ["_time"])
+        '''
 
-        if not records:
-            return pd.DataFrame()
+        try:
+            query_api = client.query_api()
+            tables = await query_api.query(query, org=settings.influxdb_org)
 
-        df = pd.DataFrame(records)
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        return df.sort_values("timestamp").reset_index(drop=True)
+            records = []
+            for table in tables:
+                for record in table.records:
+                    records.append({
+                        "timestamp": record.get_time(),
+                        "spread_pct": record.values.get("spread_pct", 0.0),
+                        "best_spread": record.values.get("best_spread", 0.0),
+                        "direction": record.values.get("direction", ""),
+                    })
 
-    except Exception as e:
-        logger.error(f"InfluxDB query failed: {e}")
+            if records:
+                chunks.append(pd.DataFrame(records))
+
+        except Exception as e:
+            logger.error(f"InfluxDB chunk query failed ({chunk_start} - {chunk_end}): {e}")
+
+        chunk_start = chunk_end
+
+    if not chunks:
         return pd.DataFrame()
+
+    df = pd.concat(chunks, ignore_index=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df.sort_values("timestamp").reset_index(drop=True)
 
 
 async def query_orderbook_depth(
@@ -66,43 +76,59 @@ async def query_orderbook_depth(
     start_time: datetime,
     end_time: datetime,
 ) -> pd.DataFrame:
-    """Query orderbook depth snapshots from InfluxDB."""
+    """Query orderbook depth snapshots from InfluxDB in daily chunks."""
     client = await get_influx_client()
     if not client:
         return pd.DataFrame()
 
-    query = f'''
-    from(bucket: "{settings.influxdb_bucket}")
-        |> range(start: {start_time.isoformat()}Z, stop: {end_time.isoformat()}Z)
-        |> filter(fn: (r) => r._measurement == "orderbook_snapshot")
-        |> filter(fn: (r) => r.symbol == "{symbol}" and r.exchange == "{exchange}")
-        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        |> sort(columns: ["_time"])
-    '''
+    depth_fields = " or ".join(
+        [f'r._field == "{side}_{i}_{col}"'
+         for side in ("bid", "ask") for i in range(5) for col in ("price", "qty")]
+    )
 
-    try:
-        query_api = client.query_api()
-        tables = await query_api.query(query, org=settings.influxdb_org)
+    chunks: list[pd.DataFrame] = []
+    chunk_start = start_time
 
-        records = []
-        for table in tables:
-            for record in table.records:
-                row = {"timestamp": record.get_time()}
-                for key, val in record.values.items():
-                    if key.startswith(("bid_", "ask_", "best_", "mid_")):
-                        row[key] = val
-                records.append(row)
+    while chunk_start < end_time:
+        chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end_time)
 
-        if not records:
-            return pd.DataFrame()
+        query = f'''
+        from(bucket: "{settings.influxdb_bucket}")
+            |> range(start: {chunk_start.isoformat()}Z, stop: {chunk_end.isoformat()}Z)
+            |> filter(fn: (r) => r._measurement == "orderbook_snapshot")
+            |> filter(fn: (r) => r.symbol == "{symbol}" and r.exchange == "{exchange}")
+            |> filter(fn: (r) => {depth_fields})
+            |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+            |> sort(columns: ["_time"])
+        '''
 
-        df = pd.DataFrame(records)
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        return df.sort_values("timestamp").reset_index(drop=True)
+        try:
+            query_api = client.query_api()
+            tables = await query_api.query(query, org=settings.influxdb_org)
 
-    except Exception as e:
-        logger.error(f"InfluxDB orderbook query failed: {e}")
+            records = []
+            for table in tables:
+                for record in table.records:
+                    row = {"timestamp": record.get_time()}
+                    for key, val in record.values.items():
+                        if key.startswith(("bid_", "ask_")):
+                            row[key] = val
+                    records.append(row)
+
+            if records:
+                chunks.append(pd.DataFrame(records))
+
+        except Exception as e:
+            logger.error(f"InfluxDB orderbook chunk query failed ({chunk_start} - {chunk_end}): {e}")
+
+        chunk_start = chunk_end
+
+    if not chunks:
         return pd.DataFrame()
+
+    df = pd.concat(chunks, ignore_index=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df.sort_values("timestamp").reset_index(drop=True)
 
 
 async def query_available_ranges() -> list[dict]:

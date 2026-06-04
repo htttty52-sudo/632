@@ -8,7 +8,7 @@ from app.config import settings
 from app.arbitrage.price_table import PriceTable
 from app.core.trading import (
     FeeConfig, evaluate_conditions, compute_trade_amount,
-    validate_trade, compute_pnl,
+    validate_trade, compute_pnl, compute_slippage_from_book,
 )
 from app.db.database import async_session
 from app.models.strategy import Strategy, StrategyLog
@@ -68,8 +68,6 @@ class StrategyEngine:
 
     SCAN_INTERVAL = 1.0
     TRADE_COOLDOWN = 5.0
-    SIMULATED_TRADE_FRACTION = 0.1
-    MIN_TRADE_AMOUNT = 1.0  # reject if available balance < this
 
     def __init__(self, price_table: PriceTable):
         self._price_table = price_table
@@ -216,16 +214,24 @@ class StrategyEngine:
             if not strat:
                 return
 
-            trade_amount = compute_trade_amount(strat.simulated_balance, self.SIMULATED_TRADE_FRACTION)
+            trade_amount = compute_trade_amount(strat.simulated_balance, settings.trade_fraction)
 
-            if not validate_trade(trade_amount, self.MIN_TRADE_AMOUNT):
+            if not validate_trade(trade_amount, settings.min_trade_amount):
                 logger.info(
                     f"Strategy '{signal.strategy_name}' rejected: "
                     f"insufficient balance ({strat.simulated_balance:.2f})"
                 )
                 return
 
-            simulated_pnl = compute_pnl(signal.spread_pct, trade_amount, fee_config)
+            sell_exchange = signal.exchange_b if signal.direction == "a_to_b" else signal.exchange_a
+            _, ask_depth = await self._price_table.get_depth(sell_exchange, signal.symbol)
+            slippage_pct = 0.0
+            if ask_depth:
+                levels = [(float(p), float(q)) for p, q in ask_depth]
+                slippage_result = compute_slippage_from_book(levels, trade_amount)
+                slippage_pct = slippage_result.slippage_pct
+
+            simulated_pnl = compute_pnl(signal.spread_pct, trade_amount, fee_config, slippage_pct)
             new_balance = strat.simulated_balance + simulated_pnl
             strat.simulated_balance = new_balance
             balance_after = new_balance

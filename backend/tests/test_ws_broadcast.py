@@ -1,4 +1,5 @@
 import asyncio
+import json
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock
@@ -30,9 +31,9 @@ async def test_broadcast_to_multiple_clients():
 
     await manager.broadcast(msg)
 
-    ws1.send_json.assert_called_once()
-    ws2.send_json.assert_called_once()
-    payload = ws1.send_json.call_args[0][0]
+    ws1.send_bytes.assert_called_once()
+    ws2.send_bytes.assert_called_once()
+    payload = json.loads(ws1.send_bytes.call_args[0][0].decode('utf-8'))
     assert payload["type"] == "orderbook"
     assert payload["data"]["exchange"] == "test"
 
@@ -43,7 +44,7 @@ async def test_dead_client_removed_on_broadcast():
 
     ws_good = AsyncMock(spec=WebSocket)
     ws_dead = AsyncMock(spec=WebSocket)
-    ws_dead.send_json.side_effect = RuntimeError("connection closed")
+    ws_dead.send_bytes.side_effect = RuntimeError("connection closed")
 
     manager._connections.add(ws_good)
     manager._connections.add(ws_dead)

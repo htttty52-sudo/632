@@ -73,6 +73,8 @@ class ExchangeSymbolSlot:
                  clock_stable_count: int, clock_stale_discard_ms: float):
         self.lock = asyncio.Lock()
         self.price: ExchangePrice | None = None
+        self.bid_depth: list[tuple[Decimal, Decimal]] = []
+        self.ask_depth: list[tuple[Decimal, Decimal]] = []
         self.clock = SlidingWindowClockEstimator(
             window_size=clock_window_size,
             stable_count=clock_stable_count,
@@ -81,7 +83,9 @@ class ExchangeSymbolSlot:
         self._stale_threshold_ms = stale_threshold_ms
 
     async def update(self, exchange: str, symbol: str, best_bid: Decimal,
-                     best_ask: Decimal, exchange_ts: int) -> None:
+                     best_ask: Decimal, exchange_ts: int,
+                     bid_depth: list[tuple[Decimal, Decimal]] | None = None,
+                     ask_depth: list[tuple[Decimal, Decimal]] | None = None) -> None:
         async with self.lock:
             now_ms = time.time() * 1000
             offset = self.clock.update(now_ms, float(exchange_ts))
@@ -95,6 +99,10 @@ class ExchangeSymbolSlot:
                 clock_offset_ms=offset,
                 is_stale=False,
             )
+            if bid_depth is not None:
+                self.bid_depth = bid_depth
+            if ask_depth is not None:
+                self.ask_depth = ask_depth
 
     async def get_price_if_valid(self) -> ExchangePrice | None:
         async with self.lock:
@@ -168,9 +176,20 @@ class PriceTable:
         return self._slots[key]
 
     async def update(self, exchange: str, symbol: str, best_bid: Decimal,
-                     best_ask: Decimal, exchange_ts: int) -> None:
+                     best_ask: Decimal, exchange_ts: int,
+                     bid_depth: list[tuple[Decimal, Decimal]] | None = None,
+                     ask_depth: list[tuple[Decimal, Decimal]] | None = None) -> None:
         slot = self._get_slot(exchange, symbol)
-        await slot.update(exchange, symbol, best_bid, best_ask, exchange_ts)
+        await slot.update(exchange, symbol, best_bid, best_ask, exchange_ts,
+                          bid_depth=bid_depth, ask_depth=ask_depth)
+
+    async def get_depth(self, exchange: str, symbol: str) -> tuple[list[tuple[Decimal, Decimal]], list[tuple[Decimal, Decimal]]]:
+        key = self._slot_key(exchange, symbol)
+        slot = self._slots.get(key)
+        if slot is None:
+            return [], []
+        async with slot.lock:
+            return list(slot.bid_depth), list(slot.ask_depth)
 
     async def get_valid_prices(self, symbol: str = "BTC/USDT") -> dict[str, ExchangePrice]:
         valid = {}

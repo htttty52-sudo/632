@@ -11,13 +11,13 @@ from numba import jit
 from app.backtest.schemas import (
     BacktestRequest, BacktestResult, EquityPoint, TradeRecord,
 )
-from app.influxdb.query import query_spread_data
+from app.core.trading import compute_slippage_from_book
+from app.influxdb.query import query_spread_data, query_orderbook_depth
 
 logger = logging.getLogger(__name__)
 
 _executor = ProcessPoolExecutor(max_workers=2)
 
-# Condition field index encoding for numba
 FIELD_SPREAD_PCT = 0
 FIELD_BEST_SPREAD = 1
 FIELD_VOLUME = 2
@@ -28,7 +28,6 @@ FIELD_MAP = {
     "volume": FIELD_VOLUME,
 }
 
-# Operator encoding for numba
 OP_GT = 0
 OP_LT = 1
 OP_GTE = 2
@@ -55,10 +54,10 @@ def _run_backtest_core(
     trade_fraction: float,
     min_trade_amount: float,
     round_trip_fee_rate: float,
-    slippage_rate: float,
+    slippage_pcts: np.ndarray,
     cooldown_periods: int,
 ):
-    """Numba-optimized backtest inner loop."""
+    """Numba-optimized backtest inner loop with per-bar slippage array."""
     n = len(spread_pcts)
     n_conds = len(condition_fields)
 
@@ -79,7 +78,6 @@ def _run_backtest_core(
             cooldown_remaining -= 1
             continue
 
-        # Evaluate conditions
         all_pass = True
         for c in range(n_conds):
             field_idx = condition_fields[c]
@@ -117,13 +115,12 @@ def _run_backtest_core(
         if not all_pass:
             continue
 
-        # Compute trade
         amount = balance * trade_fraction
         if amount < min_trade_amount:
             continue
 
         fees = amount * round_trip_fee_rate
-        slippage_cost = amount * slippage_rate
+        slippage_cost = amount * slippage_pcts[i]
         gross_pnl = amount * (spread_pcts[i] / 100.0)
         net_pnl = gross_pnl - fees - slippage_cost
 
@@ -145,8 +142,6 @@ def _compute_metrics(
     trade_pnls: np.ndarray,
     initial_balance: float,
 ) -> tuple[float, float, float]:
-    """Compute max drawdown, Sharpe ratio, win rate."""
-    # Max drawdown
     peak = initial_balance
     max_dd = 0.0
     for b in balances:
@@ -156,7 +151,6 @@ def _compute_metrics(
         if dd > max_dd:
             max_dd = dd
 
-    # Win rate
     trade_pnls_only = trade_pnls[trade_mask == 1]
     if len(trade_pnls_only) > 0:
         wins = np.sum(trade_pnls_only > 0)
@@ -164,13 +158,12 @@ def _compute_metrics(
     else:
         win_rate = 0.0
 
-    # Sharpe ratio (annualized, assuming minute bars)
     if len(trade_pnls_only) > 1:
         returns = trade_pnls_only / initial_balance
         mean_ret = np.mean(returns)
         std_ret = np.std(returns)
         if std_ret > 0:
-            sharpe = (mean_ret / std_ret) * np.sqrt(525600)  # minutes in a year
+            sharpe = (mean_ret / std_ret) * np.sqrt(525600)
         else:
             sharpe = 0.0
     else:
@@ -179,16 +172,59 @@ def _compute_metrics(
     return max_dd, sharpe, win_rate
 
 
+def _precompute_slippage_from_depth(
+    spread_df: pd.DataFrame,
+    depth_df: pd.DataFrame,
+    trade_fraction: float,
+    initial_balance: float,
+) -> np.ndarray:
+    """Pre-compute per-bar slippage_pct by calling compute_slippage_from_book."""
+    n = len(spread_df)
+    slippage_pcts = np.zeros(n, dtype=np.float64)
+
+    if depth_df.empty:
+        return slippage_pcts
+
+    depth_df = depth_df.sort_values("timestamp").reset_index(drop=True)
+    depth_timestamps = depth_df["timestamp"].values
+
+    estimate_amount = initial_balance * trade_fraction
+
+    for i in range(n):
+        ts = spread_df["timestamp"].iloc[i]
+        idx = np.searchsorted(depth_timestamps, ts, side="right") - 1
+        if idx < 0:
+            idx = 0
+
+        row = depth_df.iloc[idx]
+        ask_levels: list[tuple[float, float]] = []
+        for lvl in range(5):
+            price_col = f"ask_{lvl}_price"
+            qty_col = f"ask_{lvl}_qty"
+            if price_col in row and qty_col in row:
+                p = row.get(price_col)
+                q = row.get(qty_col)
+                if p and q and float(p) > 0 and float(q) > 0:
+                    ask_levels.append((float(p), float(q)))
+
+        if ask_levels:
+            result = compute_slippage_from_book(ask_levels, estimate_amount)
+            slippage_pcts[i] = result.slippage_pct / 100.0
+        else:
+            slippage_pcts[i] = 0.0
+
+    return slippage_pcts
+
+
 def _run_backtest_sync(params: dict) -> dict:
-    """Synchronous backtest function to run in process pool."""
     start_t = time.perf_counter()
 
     spread_pcts = np.array(params["spread_pcts"], dtype=np.float64)
     best_spreads = np.array(params["best_spreads"], dtype=np.float64)
+    slippage_pcts = np.array(params["slippage_pcts"], dtype=np.float64)
     timestamps = params["timestamps"]
     directions = params["directions"]
 
-    # Encode conditions
     conditions = params["conditions"]
     condition_fields = np.array(
         [FIELD_MAP.get(c.get("field", ""), 0) for c in conditions], dtype=np.int64
@@ -204,10 +240,8 @@ def _run_backtest_sync(params: dict) -> dict:
     trade_fraction = params["trade_fraction"]
     min_trade_amount = params["min_trade_amount"]
     round_trip_fee_rate = params["maker_fee_rate"] + params["taker_fee_rate"]
-    slippage_rate = params["slippage_multiplier"]
     cooldown_seconds = params["cooldown_seconds"]
 
-    # Estimate data interval (assume 1 minute if can't detect)
     if len(timestamps) > 1:
         intervals = [(timestamps[i+1] - timestamps[i]).total_seconds() for i in range(min(10, len(timestamps)-1))]
         avg_interval = max(sum(intervals) / len(intervals), 1.0)
@@ -215,7 +249,6 @@ def _run_backtest_sync(params: dict) -> dict:
         avg_interval = 60.0
     cooldown_periods = max(1, int(cooldown_seconds / avg_interval))
 
-    # Run numba core
     balances, trade_mask, trade_pnls, trade_amounts, trade_fees, trade_slippages = _run_backtest_core(
         spread_pcts=spread_pcts,
         best_spreads=best_spreads,
@@ -226,16 +259,14 @@ def _run_backtest_sync(params: dict) -> dict:
         trade_fraction=trade_fraction,
         min_trade_amount=min_trade_amount,
         round_trip_fee_rate=round_trip_fee_rate,
-        slippage_rate=slippage_rate,
+        slippage_pcts=slippage_pcts,
         cooldown_periods=cooldown_periods,
     )
 
-    # Compute metrics
     max_dd, sharpe, win_rate = _compute_metrics(
         balances, trade_mask, trade_pnls, initial_balance
     )
 
-    # Build equity curve (sample at most 1000 points for frontend)
     n = len(balances)
     step = max(1, n // 1000)
     equity_curve = []
@@ -246,7 +277,6 @@ def _run_backtest_sync(params: dict) -> dict:
             "pnl": float(balances[i] - initial_balance),
         })
 
-    # Build trade list
     trades = []
     trade_indices = np.where(trade_mask == 1)[0]
     for idx in trade_indices:
@@ -254,7 +284,7 @@ def _run_backtest_sync(params: dict) -> dict:
             "timestamp": timestamps[idx].isoformat() if hasattr(timestamps[idx], 'isoformat') else str(timestamps[idx]),
             "spread_pct": float(spread_pcts[idx]),
             "trade_amount": float(trade_amounts[idx]),
-            "slippage_pct": float(slippage_rate * 100),
+            "slippage_pct": float(slippage_pcts[idx] * 100),
             "fees": float(trade_fees[idx]),
             "pnl": float(trade_pnls[idx]),
             "balance_after": float(balances[idx]),
@@ -307,9 +337,25 @@ async def run_backtest(request: BacktestRequest) -> BacktestResult:
             execution_time_ms=0.0,
         )
 
+    # Pre-compute slippage array
+    if request.slippage_model == "orderbook":
+        sell_exchange = request.exchange_b
+        depth_df = await query_orderbook_depth(
+            symbol=request.symbol,
+            exchange=sell_exchange,
+            start_time=request.start_time,
+            end_time=request.end_time,
+        )
+        slippage_pcts = _precompute_slippage_from_depth(
+            df, depth_df, request.trade_fraction, request.initial_balance
+        )
+    else:
+        slippage_pcts = np.full(len(df), request.slippage_multiplier, dtype=np.float64)
+
     params = {
         "spread_pcts": df["spread_pct"].tolist(),
         "best_spreads": df["best_spread"].tolist(),
+        "slippage_pcts": slippage_pcts.tolist(),
         "timestamps": df["timestamp"].tolist(),
         "directions": df["direction"].tolist() if "direction" in df.columns else [""] * len(df),
         "conditions": request.conditions,
@@ -319,7 +365,6 @@ async def run_backtest(request: BacktestRequest) -> BacktestResult:
         "maker_fee_rate": request.maker_fee_rate,
         "taker_fee_rate": request.taker_fee_rate,
         "cooldown_seconds": request.cooldown_seconds,
-        "slippage_multiplier": request.slippage_multiplier,
     }
 
     loop = asyncio.get_event_loop()
