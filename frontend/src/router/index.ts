@@ -16,6 +16,11 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      path: '/strategy',
+      component: () => import('../views/StrategyLab.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
       path: '/admin',
       // Component is resolved dynamically at navigation time.
       // Non-admin users get a lightweight stub - the AdminConfig chunk is never fetched.

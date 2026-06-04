@@ -35,6 +35,7 @@ import { useWebSocket } from '../composables/useWebSocket'
 import { useOrderBookStore } from '../stores/orderbook'
 import { useTradesStore } from '../stores/trades'
 import { useSpreadStore } from '../stores/spread'
+import { useStrategyStore } from '../stores/strategy'
 import type { WSMessage, UnifiedOrderBook, UnifiedTrade, SpreadMatrix, SpreadAlertEvent } from '../types/market'
 import ConnectionStatus from '../components/ConnectionStatus.vue'
 import OrderBook from '../components/OrderBook.vue'
@@ -46,6 +47,7 @@ import SpreadAlertToast from '../components/SpreadAlertToast.vue'
 const orderbookStore = useOrderBookStore()
 const tradesStore = useTradesStore()
 const spreadStore = useSpreadStore()
+const strategyStore = useStrategyStore()
 const updateRate = ref(0)
 
 let msgCount = 0
@@ -76,6 +78,9 @@ const { status: wsStatus } = useWebSocket('/ws/market', {
         break
       case 'spread_alert':
         spreadStore.handleAlert(msg.data as SpreadAlertEvent)
+        break
+      case 'strategy_trigger':
+        strategyStore.handleTriggerEvent(msg.data as any)
         break
     }
   },

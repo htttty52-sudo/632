@@ -52,6 +52,18 @@ class ConnectionManager:
         for ws in dead:
             self._connections.discard(ws)
 
+    async def broadcast_raw(self, payload: dict):
+        if not self._connections:
+            return
+        dead: list[WebSocket] = []
+        for ws in self._connections.copy():
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self._connections.discard(ws)
+
     @property
     def client_count(self) -> int:
         return len(self._connections)

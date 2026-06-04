@@ -63,7 +63,20 @@ export interface SpreadAlertEvent {
   timestamp: number
 }
 
+export interface StrategyTriggerEvent {
+  strategy_id: number
+  strategy_name: string
+  user_id: number
+  symbol: string
+  exchange_a: string
+  exchange_b: string
+  direction: string
+  spread_pct: number
+  simulated_pnl: number
+  balance_after: number
+}
+
 export interface WSMessage {
-  type: 'orderbook' | 'trade' | 'spread' | 'spread_matrix' | 'spread_alert'
-  data: UnifiedOrderBook | UnifiedTrade | SpreadSnapshot | SpreadMatrix | SpreadAlertEvent
+  type: 'orderbook' | 'trade' | 'spread' | 'spread_matrix' | 'spread_alert' | 'strategy_trigger'
+  data: UnifiedOrderBook | UnifiedTrade | SpreadSnapshot | SpreadMatrix | SpreadAlertEvent | StrategyTriggerEvent
 }
