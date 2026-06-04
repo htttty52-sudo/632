@@ -2,17 +2,11 @@
   <div class="p-4 max-w-6xl mx-auto">
     <div class="flex items-center justify-between mb-6">
       <h2 class="text-xl font-bold text-white">策略实验室</h2>
-      <div class="flex items-center gap-4">
-        <span class="text-sm text-gray-400">
-          总模拟盈亏: <span :class="totalPnl >= 0 ? 'text-green-400' : 'text-red-400'">
-            {{ totalPnl >= 0 ? '+' : '' }}{{ totalPnl.toFixed(2) }} USDT
-          </span>
+      <span class="text-sm text-gray-400">
+        总模拟盈亏: <span :class="totalPnl >= 0 ? 'text-green-400' : 'text-red-400'">
+          {{ totalPnl >= 0 ? '+' : '' }}{{ totalPnl.toFixed(2) }} USDT
         </span>
-        <button v-if="auth.isAdmin" @click="viewMode = viewMode === 'mine' ? 'all' : 'mine'"
-          class="px-3 py-1 text-xs rounded bg-gray-700 text-gray-300 hover:bg-gray-600">
-          {{ viewMode === 'mine' ? '查看全部' : '仅看自己' }}
-        </button>
-      </div>
+      </span>
     </div>
 
     <!-- Create Strategy Form -->
@@ -65,7 +59,7 @@
     <div class="bg-gray-800 rounded-lg border border-gray-700 mb-6">
       <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
         <h3 class="text-sm font-medium text-gray-300">我的策略</h3>
-        <button @click="refreshData" class="text-xs text-gray-500 hover:text-white">刷新</button>
+        <button @click="store.fetchStrategies()" class="text-xs text-gray-500 hover:text-white">刷新</button>
       </div>
       <div v-if="loading" class="p-4 text-center text-gray-500 text-sm">加载中...</div>
       <div v-else-if="!strategies.length" class="p-4 text-center text-gray-500 text-sm">暂无策略</div>
@@ -176,12 +170,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useStrategyStore, type ConditionRule } from '../stores/strategy'
-import { useAuthStore } from '../stores/auth'
 
 const store = useStrategyStore()
-const auth = useAuthStore()
 
-const viewMode = ref<'mine' | 'all'>('mine')
 const showLogs = ref(false)
 
 const strategies = computed(() => store.strategies)
@@ -228,15 +219,7 @@ async function viewLogs(strategyId: number) {
   await store.fetchLogs(strategyId)
 }
 
-async function refreshData() {
-  if (auth.isAdmin && viewMode.value === 'all') {
-    await store.fetchAllStrategies()
-  } else {
-    await store.fetchStrategies()
-  }
-}
-
 onMounted(() => {
-  refreshData()
+  store.fetchStrategies()
 })
 </script>

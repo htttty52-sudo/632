@@ -68,16 +68,6 @@ export const useStrategyStore = defineStore('strategy', () => {
     }
   }
 
-  async function fetchAllStrategies() {
-    loading.value = true
-    try {
-      const res = await api.get('/strategies/all')
-      strategies.value = res.data
-    } finally {
-      loading.value = false
-    }
-  }
-
   async function createStrategy(name: string, conditions: ConditionRule[], balance: number) {
     const res = await api.post('/strategies/', { name, conditions, simulated_balance: balance })
     strategies.value.unshift(res.data)
@@ -115,7 +105,7 @@ export const useStrategyStore = defineStore('strategy', () => {
 
   return {
     strategies, logs, loading, recentTriggers, totalPnl,
-    fetchStrategies, fetchAllStrategies, createStrategy, updateStrategy,
+    fetchStrategies, createStrategy, updateStrategy,
     deleteStrategy, fetchLogs, handleTriggerEvent,
   }
 })

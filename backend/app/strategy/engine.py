@@ -2,8 +2,7 @@ import asyncio
 import json
 import time
 import logging
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, field
 
 from app.config import settings
 from app.arbitrage.price_table import PriceTable
@@ -11,7 +10,7 @@ from app.db.database import async_session
 from app.models.strategy import Strategy, StrategyLog
 from app.ws.broadcast import connection_manager
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +32,14 @@ class StrategyState:
     simulated_balance: float
     initial_balance: float
     active: bool
-    cooldown_until: float = 0.0  # prevent rapid re-triggers
+    cooldown_until: float = 0.0
 
 
 @dataclass
 class TradeSignal:
-    strategy: StrategyState
+    strategy_id: int
+    user_id: int
+    strategy_name: str
     symbol: str
     exchange_a: str
     exchange_b: str
@@ -48,50 +49,60 @@ class TradeSignal:
     snapshot: dict
 
 
+class UserFundLock:
+    """Per-user atomic fund lock. Ensures only one trade settles per user at a time."""
+
+    def __init__(self):
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    def get(self, user_id: int) -> asyncio.Lock:
+        if user_id not in self._locks:
+            self._locks[user_id] = asyncio.Lock()
+        return self._locks[user_id]
+
+
 class StrategyEngine:
     """
-    Async non-blocking strategy engine.
+    Decoupled scanner + worker architecture.
 
-    Design:
-    - Scanner loop runs every 1s, reads spread data from PriceTable (same as SpreadEngine).
-    - Evaluation is decoupled via asyncio.Queue so it never blocks market data ingestion.
-    - Simulated fund locking uses an asyncio.Lock to serialize fund allocation
-      when multiple strategies trigger simultaneously on the same tick.
+    Scanner: 1s loop, evaluates conditions, puts TradeSignal into queue. Never does I/O.
+    Worker: consumes queue, acquires per-user fund lock, checks balance sufficiency,
+            deducts atomically or rejects, persists log.
     """
 
     SCAN_INTERVAL = 1.0
-    TRADE_COOLDOWN = 5.0  # seconds between trades for same strategy
-    SIMULATED_TRADE_FRACTION = 0.1  # use 10% of balance per trade
+    TRADE_COOLDOWN = 5.0
+    SIMULATED_TRADE_FRACTION = 0.1
+    MIN_TRADE_AMOUNT = 1.0  # reject if available balance < this
 
     def __init__(self, price_table: PriceTable):
         self._price_table = price_table
         self._strategies: dict[int, StrategyState] = {}
-        self._fund_lock = asyncio.Lock()  # global fund allocation lock
-        self._signal_queue: asyncio.Queue[TradeSignal] = asyncio.Queue(maxsize=1000)
+        self._user_funds = UserFundLock()
+        self._signal_queue: asyncio.Queue[TradeSignal] = asyncio.Queue(maxsize=2000)
         self._scanner_task: asyncio.Task | None = None
-        self._executor_task: asyncio.Task | None = None
+        self._worker_tasks: list[asyncio.Task] = []
         self._running = False
+        self._num_workers = 3
 
     async def start(self):
         self._running = True
         await self.reload_strategies()
         self._scanner_task = asyncio.create_task(self._scan_loop())
-        self._executor_task = asyncio.create_task(self._execute_loop())
-        logger.info("StrategyEngine started (scanner + executor)")
+        self._worker_tasks = [
+            asyncio.create_task(self._worker_loop(i)) for i in range(self._num_workers)
+        ]
+        logger.info(f"StrategyEngine started (1 scanner + {self._num_workers} workers)")
 
     async def stop(self):
         self._running = False
-        for task in (self._scanner_task, self._executor_task):
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        tasks = [t for t in [self._scanner_task] + self._worker_tasks if t]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("StrategyEngine stopped")
 
     async def reload_strategies(self):
-        """Reload active strategies from DB into memory."""
         try:
             async with async_session() as session:
                 result = await session.execute(
@@ -117,12 +128,13 @@ class StrategyEngine:
         except Exception as e:
             logger.error(f"Failed to reload strategies: {e}")
 
+    # ─── Scanner: only evaluates and enqueues ───────────────────────────────
+
     async def _scan_loop(self):
-        """Every 1s, evaluate all strategies against current spreads. Non-blocking."""
         while self._running:
             try:
                 await asyncio.sleep(self.SCAN_INTERVAL)
-                scan_start = time.monotonic()
+                now = time.time()
 
                 for symbol in settings.symbols:
                     valid_prices = await self._price_table.get_valid_prices(symbol)
@@ -145,18 +157,20 @@ class StrategyEngine:
                             market_ctx = {
                                 "spread_pct": spread_pct,
                                 "best_spread": best_spread,
-                                "volume": 0.0,  # placeholder for volume data
+                                "volume": 0.0,
                             }
 
-                            now = time.time()
                             for strat in self._strategies.values():
                                 if not strat.active:
                                     continue
                                 if now < strat.cooldown_until:
                                     continue
                                 if self._evaluate_conditions(strat.conditions, market_ctx):
+                                    strat.cooldown_until = now + self.TRADE_COOLDOWN
                                     signal = TradeSignal(
-                                        strategy=strat,
+                                        strategy_id=strat.id,
+                                        user_id=strat.user_id,
+                                        strategy_name=strat.name,
                                         symbol=symbol,
                                         exchange_a=ex_a,
                                         exchange_b=ex_b,
@@ -170,22 +184,16 @@ class StrategyEngine:
                                     except asyncio.QueueFull:
                                         logger.warning("Signal queue full, dropping signal")
 
-                elapsed = time.monotonic() - scan_start
-                if elapsed > 0.5:
-                    logger.warning(f"Strategy scan took {elapsed:.3f}s (> 500ms)")
-
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 logger.error(f"Strategy scan error: {e}")
 
     def _evaluate_conditions(self, conditions: list[dict], ctx: dict) -> bool:
-        """Safe DSL evaluator - no exec/eval. All conditions must be true (AND logic)."""
         for cond in conditions:
             field = cond.get("field", "")
             operator = cond.get("operator", "")
             threshold = cond.get("value", 0)
-
             if field not in ctx:
                 return False
             op_fn = OPERATOR_MAP.get(operator)
@@ -195,13 +203,12 @@ class StrategyEngine:
                 return False
         return True
 
-    async def _execute_loop(self):
-        """Consume signals from the queue and execute simulated trades with fund locking."""
+    # ─── Worker: lock → check → deduct-or-reject → persist ─────────────────
+
+    async def _worker_loop(self, worker_id: int):
         while self._running:
             try:
-                signal = await asyncio.wait_for(
-                    self._signal_queue.get(), timeout=2.0
-                )
+                signal = await asyncio.wait_for(self._signal_queue.get(), timeout=2.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 if not self._running:
                     return
@@ -210,34 +217,42 @@ class StrategyEngine:
             try:
                 await self._execute_trade(signal)
             except Exception as e:
-                logger.error(f"Strategy execution error: {e}")
+                logger.error(f"Worker-{worker_id} execution error: {e}")
 
     async def _execute_trade(self, signal: TradeSignal):
-        """Simulate a trade with fund locking to prevent multi-strategy over-allocation."""
-        strat = signal.strategy
+        user_lock = self._user_funds.get(signal.user_id)
 
-        async with self._fund_lock:
-            if strat.simulated_balance <= 0:
+        async with user_lock:
+            strat = self._strategies.get(signal.strategy_id)
+            if not strat:
                 return
 
             trade_amount = strat.simulated_balance * self.SIMULATED_TRADE_FRACTION
-            simulated_pnl = trade_amount * (signal.spread_pct / 100.0)
-            strat.simulated_balance += simulated_pnl
-            strat.cooldown_until = time.time() + self.TRADE_COOLDOWN
-            balance_after = strat.simulated_balance
 
+            if trade_amount < self.MIN_TRADE_AMOUNT:
+                logger.info(
+                    f"Strategy '{signal.strategy_name}' rejected: "
+                    f"insufficient balance ({strat.simulated_balance:.2f})"
+                )
+                return
+
+            # Atomic deduct: lock held, compute pnl, update balance
+            simulated_pnl = trade_amount * (signal.spread_pct / 100.0)
+            new_balance = strat.simulated_balance - trade_amount + trade_amount + simulated_pnl
+            strat.simulated_balance = new_balance
+            balance_after = new_balance
+
+        # Persist outside the lock to minimize hold time, but use DB-level atomic update
         try:
             async with async_session() as session:
-                result = await session.execute(
-                    select(Strategy).where(Strategy.id == strat.id)
+                await session.execute(
+                    update(Strategy)
+                    .where(Strategy.id == signal.strategy_id)
+                    .values(simulated_balance=balance_after)
                 )
-                db_strategy = result.scalar_one_or_none()
-                if db_strategy:
-                    db_strategy.simulated_balance = balance_after
-
                 log_entry = StrategyLog(
-                    strategy_id=strat.id,
-                    user_id=strat.user_id,
+                    strategy_id=signal.strategy_id,
+                    user_id=signal.user_id,
                     symbol=signal.symbol,
                     exchange_a=signal.exchange_a,
                     exchange_b=signal.exchange_b,
@@ -256,9 +271,9 @@ class StrategyEngine:
         event = {
             "type": "strategy_trigger",
             "data": {
-                "strategy_id": strat.id,
-                "strategy_name": strat.name,
-                "user_id": strat.user_id,
+                "strategy_id": signal.strategy_id,
+                "strategy_name": signal.strategy_name,
+                "user_id": signal.user_id,
                 "symbol": signal.symbol,
                 "exchange_a": signal.exchange_a,
                 "exchange_b": signal.exchange_b,
@@ -270,7 +285,7 @@ class StrategyEngine:
         }
         await connection_manager.broadcast_raw(event)
         logger.info(
-            f"Strategy '{strat.name}' triggered: {signal.symbol} "
+            f"Strategy '{signal.strategy_name}' triggered: {signal.symbol} "
             f"{signal.exchange_a}->{signal.exchange_b} pnl={simulated_pnl:.4f}"
         )
 

@@ -7,14 +7,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.database import get_db
 from app.models.user import User
 from app.models.strategy import Strategy, StrategyLog
-from app.auth.dependencies import get_current_user, require_admin
+from app.auth.dependencies import get_current_user
 
 router = APIRouter()
 
 
 class ConditionRule(BaseModel):
-    field: str  # "spread_pct", "volume", "best_spread"
-    operator: str  # ">", "<", ">=", "<=", "=="
+    field: str
+    operator: str
     value: float
 
 
@@ -75,23 +75,31 @@ def _strategy_to_response(s: Strategy) -> StrategyResponse:
     )
 
 
+def _build_strategy_query(current_user: User):
+    """Admin sees all strategies; normal user sees only their own."""
+    query = select(Strategy)
+    if current_user.role != "admin":
+        query = query.where(Strategy.user_id == current_user.id)
+    return query.order_by(Strategy.id.desc())
+
+
+def _build_log_query(current_user: User, strategy_id: int | None, limit: int):
+    """Admin sees all logs; normal user sees only their own."""
+    query = select(StrategyLog)
+    if current_user.role != "admin":
+        query = query.where(StrategyLog.user_id == current_user.id)
+    if strategy_id:
+        query = query.where(StrategyLog.strategy_id == strategy_id)
+    return query.order_by(StrategyLog.id.desc()).limit(limit)
+
+
 @router.get("/", response_model=list[StrategyResponse])
 async def list_strategies(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Strategy).where(Strategy.user_id == current_user.id).order_by(Strategy.id.desc())
-    )
-    return [_strategy_to_response(s) for s in result.scalars().all()]
-
-
-@router.get("/all", response_model=list[StrategyResponse])
-async def list_all_strategies(
-    _admin: User = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(Strategy).order_by(Strategy.id.desc()))
+    query = _build_strategy_query(current_user)
+    result = await db.execute(query)
     return [_strategy_to_response(s) for s in result.scalars().all()]
 
 
@@ -178,38 +186,7 @@ async def list_logs(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(StrategyLog).where(StrategyLog.user_id == current_user.id)
-    if strategy_id:
-        query = query.where(StrategyLog.strategy_id == strategy_id)
-    query = query.order_by(StrategyLog.id.desc()).limit(limit)
-    result = await db.execute(query)
-    logs = result.scalars().all()
-    return [
-        StrategyLogResponse(
-            id=log.id,
-            strategy_id=log.strategy_id,
-            triggered_at=str(log.triggered_at) if log.triggered_at else None,
-            symbol=log.symbol,
-            exchange_a=log.exchange_a,
-            exchange_b=log.exchange_b,
-            direction=log.direction,
-            spread_pct=log.spread_pct,
-            simulated_quantity=log.simulated_quantity,
-            simulated_pnl=log.simulated_pnl,
-            balance_after=log.balance_after,
-            condition_snapshot=log.condition_snapshot,
-        )
-        for log in logs
-    ]
-
-
-@router.get("/logs/all", response_model=list[StrategyLogResponse])
-async def list_all_logs(
-    limit: int = Query(50, le=200),
-    _admin: User = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    query = select(StrategyLog).order_by(StrategyLog.id.desc()).limit(limit)
+    query = _build_log_query(current_user, strategy_id, limit)
     result = await db.execute(query)
     logs = result.scalars().all()
     return [
