@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 class MockClient(BaseExchangeClient):
     """Generates realistic fake BTC/USDT market data for testing."""
 
-    def __init__(self, exchange_name: str = "mock", rate_ms: int = 50):
+    def __init__(self, exchange_name: str = "mock", rate_ms: int = 50, base_price_offset: float = 0.0):
         super().__init__(exchange_name)
         self._rate_ms = rate_ms
         self._sequence = 0
-        self._base_price = Decimal("67500.00")
+        self._base_price = Decimal("67500.00") + Decimal(str(base_price_offset))
         self._trade_id = 1000000
 
     async def _send_subscriptions(self, ws) -> None:

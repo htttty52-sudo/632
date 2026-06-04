@@ -20,6 +20,12 @@
         <TradeList />
       </div>
     </div>
+
+    <div class="mt-4">
+      <SpreadMatrixHeatmap />
+    </div>
+
+    <SpreadAlertToast />
   </div>
 </template>
 
@@ -28,14 +34,18 @@ import { ref } from 'vue'
 import { useWebSocket } from '../composables/useWebSocket'
 import { useOrderBookStore } from '../stores/orderbook'
 import { useTradesStore } from '../stores/trades'
-import type { WSMessage, UnifiedOrderBook, UnifiedTrade } from '../types/market'
+import { useSpreadStore } from '../stores/spread'
+import type { WSMessage, UnifiedOrderBook, UnifiedTrade, SpreadMatrix, SpreadAlertEvent } from '../types/market'
 import ConnectionStatus from '../components/ConnectionStatus.vue'
 import OrderBook from '../components/OrderBook.vue'
 import TradeList from '../components/TradeList.vue'
 import SpreadIndicator from '../components/SpreadIndicator.vue'
+import SpreadMatrixHeatmap from '../components/SpreadMatrixHeatmap.vue'
+import SpreadAlertToast from '../components/SpreadAlertToast.vue'
 
 const orderbookStore = useOrderBookStore()
 const tradesStore = useTradesStore()
+const spreadStore = useSpreadStore()
 const updateRate = ref(0)
 
 let msgCount = 0
@@ -60,6 +70,12 @@ const { status: wsStatus } = useWebSocket('/ws/market', {
         break
       case 'trade':
         tradesStore.handleTrade(msg.data as UnifiedTrade)
+        break
+      case 'spread_matrix':
+        spreadStore.handleSpreadMatrix(msg.data as SpreadMatrix)
+        break
+      case 'spread_alert':
+        spreadStore.handleAlert(msg.data as SpreadAlertEvent)
         break
     }
   },

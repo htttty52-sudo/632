@@ -37,7 +37,33 @@ export interface SpreadSnapshot {
   timestamp: number
 }
 
+export interface SpreadCell {
+  exchange_a: string
+  exchange_b: string
+  spread_ab: number
+  spread_ba: number
+  best_spread: number
+  spread_pct: number
+}
+
+export interface SpreadMatrix {
+  symbol: string
+  exchanges: string[]
+  cells: SpreadCell[]
+  stale_exchanges: string[]
+  timestamp: number
+}
+
+export interface SpreadAlertEvent {
+  symbol: string
+  exchange_a: string
+  exchange_b: string
+  spread_pct: number
+  direction: string
+  timestamp: number
+}
+
 export interface WSMessage {
-  type: 'orderbook' | 'trade' | 'spread'
-  data: UnifiedOrderBook | UnifiedTrade | SpreadSnapshot
+  type: 'orderbook' | 'trade' | 'spread' | 'spread_matrix' | 'spread_alert'
+  data: UnifiedOrderBook | UnifiedTrade | SpreadSnapshot | SpreadMatrix | SpreadAlertEvent
 }

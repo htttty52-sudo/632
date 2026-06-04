@@ -5,7 +5,9 @@ import logging
 from app.config import settings
 from app.dedup.deduplicator import MessageDeduplicator
 from app.exchanges.base import BaseExchangeClient
+from app.models.market import UnifiedOrderBook
 from app.ws.broadcast import connection_manager
+from app.arbitrage.price_table import PriceTable
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,10 @@ class ExchangeManager:
         self._states: dict[str, ReconnectState] = {}
         self._dedup = MessageDeduplicator(window_size=settings.dedup_max_size)
         self._running = False
+        self.price_table = PriceTable(
+            stale_threshold_ms=settings.stale_threshold_ms,
+            clock_alpha=settings.clock_alpha,
+        )
 
     async def start(self):
         self._running = True
@@ -63,13 +69,16 @@ class ExchangeManager:
     def _init_clients(self):
         if settings.use_mock:
             from app.exchanges.mock import MockClient
-            self._clients["mock_binance"] = MockClient("mock_binance", rate_ms=50)
-            self._clients["mock_okx"] = MockClient("mock_okx", rate_ms=80)
+            self._clients["mock_binance"] = MockClient("mock_binance", rate_ms=50, base_price_offset=0.0)
+            self._clients["mock_okx"] = MockClient("mock_okx", rate_ms=80, base_price_offset=15.0)
+            self._clients["mock_huobi"] = MockClient("mock_huobi", rate_ms=70, base_price_offset=-10.0)
         else:
             from app.exchanges.binance import BinanceClient
             from app.exchanges.okx import OKXClient
+            from app.exchanges.huobi import HuobiClient
             self._clients["binance"] = BinanceClient()
             self._clients["okx"] = OKXClient()
+            self._clients["huobi"] = HuobiClient()
 
     async def _run_with_reconnect(self, name: str, client: BaseExchangeClient):
         backoff = ExponentialBackoff(
@@ -78,6 +87,7 @@ class ExchangeManager:
             max_delay=settings.reconnect_max_delay,
         )
         state = self._states[name]
+        delay = 0.0
 
         while self._running:
             async with state.lock:
@@ -97,20 +107,30 @@ class ExchangeManager:
                             break
                         if not self._dedup.is_duplicate(msg.msg_id):
                             await connection_manager.broadcast(msg)
+                            if isinstance(msg, UnifiedOrderBook) and msg.bids and msg.asks:
+                                await self.price_table.update(
+                                    exchange=msg.exchange,
+                                    symbol=msg.symbol,
+                                    best_bid=msg.bids[0].price,
+                                    best_ask=msg.asks[0].price,
+                                    exchange_ts=msg.timestamp,
+                                )
                     backoff.reset()
                 except asyncio.CancelledError:
                     return
                 except Exception as e:
                     if not self._running:
                         return
+                    await self.price_table.mark_exchange_stale(name)
                     state.reconnect_count += 1
                     state.is_reconnecting = False
                     delay = backoff.next_delay()
                     logger.warning(f"{name} disconnected ({e}), reconnecting in {delay:.1f}s")
 
             # Sleep outside the lock so other coroutines can check state
-            if self._running:
+            if self._running and delay > 0:
                 await asyncio.sleep(delay)
+                delay = 0.0
 
 
 exchange_manager = ExchangeManager()

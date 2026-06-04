@@ -9,8 +9,12 @@ from app.db.database import init_db
 async def lifespan(app: FastAPI):
     await init_db()
     from app.exchanges.manager import exchange_manager
+    from app.arbitrage.spread_engine import SpreadEngine
+    spread_engine = SpreadEngine(exchange_manager.price_table)
     await exchange_manager.start()
+    await spread_engine.start()
     yield
+    await spread_engine.stop()
     await exchange_manager.stop()
 
 

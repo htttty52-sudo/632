@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     binance_ws_url: str = "wss://stream.binance.com:9443/ws"
     okx_ws_url: str = "wss://ws.okx.com:8443/ws/v5/public"
+    huobi_ws_url: str = "wss://api.huobi.pro/ws"
 
     symbols: list[str] = ["BTC/USDT"]
     depth_levels: int = 20
@@ -21,6 +22,12 @@ class Settings(BaseSettings):
 
     dedup_ttl_seconds: float = 5.0
     dedup_max_size: int = 10000
+
+    stale_threshold_ms: float = 5000.0
+    clock_alpha: float = 0.1
+    spread_broadcast_interval_ms: float = 500.0
+    spread_alert_threshold_pct: float = 0.1
+    spread_alert_cooldown_seconds: float = 30.0
 
     use_mock: bool = False
 

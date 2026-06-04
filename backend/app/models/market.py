@@ -40,3 +40,29 @@ class SpreadSnapshot(BaseModel):
     spread: Decimal
     spread_pct: Decimal
     timestamp: int
+
+
+class SpreadCell(BaseModel):
+    exchange_a: str
+    exchange_b: str
+    spread_ab: Decimal
+    spread_ba: Decimal
+    best_spread: Decimal
+    spread_pct: Decimal
+
+
+class SpreadMatrix(BaseModel):
+    symbol: str
+    exchanges: list[str]
+    cells: list[SpreadCell]
+    stale_exchanges: list[str]
+    timestamp: int
+
+
+class SpreadAlertEvent(BaseModel):
+    symbol: str
+    exchange_a: str
+    exchange_b: str
+    spread_pct: Decimal
+    direction: str
+    timestamp: int

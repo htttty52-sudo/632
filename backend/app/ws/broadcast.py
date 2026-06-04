@@ -3,11 +3,13 @@ from typing import Union
 
 from fastapi import WebSocket
 
-from app.models.market import UnifiedOrderBook, UnifiedTrade, SpreadSnapshot
+from app.models.market import (
+    UnifiedOrderBook, UnifiedTrade, SpreadSnapshot, SpreadMatrix, SpreadAlertEvent
+)
 
 logger = logging.getLogger(__name__)
 
-MarketData = Union[UnifiedOrderBook, UnifiedTrade, SpreadSnapshot]
+MarketData = Union[UnifiedOrderBook, UnifiedTrade, SpreadSnapshot, SpreadMatrix, SpreadAlertEvent]
 
 
 class ConnectionManager:
@@ -31,6 +33,10 @@ class ConnectionManager:
             msg_type = "orderbook"
         elif isinstance(data, UnifiedTrade):
             msg_type = "trade"
+        elif isinstance(data, SpreadMatrix):
+            msg_type = "spread_matrix"
+        elif isinstance(data, SpreadAlertEvent):
+            msg_type = "spread_alert"
         else:
             msg_type = "spread"
 
