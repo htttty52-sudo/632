@@ -48,6 +48,8 @@ class ExchangeManager:
         self.price_table = PriceTable(
             stale_threshold_ms=settings.stale_threshold_ms,
             clock_window_size=settings.clock_window_size,
+            clock_stable_count=settings.clock_stable_count,
+            clock_stale_discard_ms=settings.clock_stale_discard_ms,
         )
 
     async def start(self):
@@ -91,8 +93,6 @@ class ExchangeManager:
 
         while self._running:
             async with state.lock:
-                # Lock held: only one reconnect attempt at a time per exchange.
-                # This guarantees subscriptions are sent exactly once per connection.
                 state.is_reconnecting = True
                 try:
                     if state.reconnect_count > 0:
@@ -100,8 +100,11 @@ class ExchangeManager:
                             f"{name} reconnect #{state.reconnect_count}, "
                             "re-subscribing (lock held, single subscription guaranteed)"
                         )
+                        # Clear stale for all symbols on reconnect
+                        await self.price_table.clear_exchange_stale(name)
                     state.is_reconnecting = False
 
+                    first_orderbook = True
                     async for msg in client.connect_and_stream():
                         if not self._running:
                             break
@@ -115,19 +118,22 @@ class ExchangeManager:
                                     best_ask=msg.asks[0].price,
                                     exchange_ts=msg.timestamp,
                                 )
+                                if first_orderbook and state.reconnect_count > 0:
+                                    first_orderbook = False
+                                    logger.info(f"{name} reconnect price restored")
                     backoff.reset()
                 except asyncio.CancelledError:
                     return
                 except Exception as e:
                     if not self._running:
                         return
+                    # Mark all symbols stale for this exchange
                     await self.price_table.mark_exchange_stale(name)
                     state.reconnect_count += 1
                     state.is_reconnecting = False
                     delay = backoff.next_delay()
                     logger.warning(f"{name} disconnected ({e}), reconnecting in {delay:.1f}s")
 
-            # Sleep outside the lock so other coroutines can check state
             if self._running and delay > 0:
                 await asyncio.sleep(delay)
                 delay = 0.0

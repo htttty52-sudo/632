@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+from collections import deque
 from decimal import Decimal
 
 from app.config import settings
@@ -14,16 +15,18 @@ logger = logging.getLogger(__name__)
 
 
 class SpreadEngine:
-    """Computes pairwise spread matrix and triggers alerts with 30-min cooldown per pair."""
+    """Computes pairwise spread matrix. Alerts: max N per 5-min window per pair type."""
 
     def __init__(self, price_table: PriceTable):
         self._price_table = price_table
         self._interval = settings.spread_broadcast_interval_ms / 1000.0
         self._threshold_pct = Decimal(str(settings.spread_alert_threshold_pct))
         self._cooldown_seconds = settings.spread_alert_cooldown_seconds
+        self._max_per_window = settings.spread_alert_max_per_window
         self._task: asyncio.Task | None = None
         self._running = False
-        self._last_alert_time: dict[str, float] = {}
+        # key -> deque of timestamps within the cooldown window
+        self._alert_timestamps: dict[str, deque[float]] = {}
 
     async def start(self):
         self._running = True
@@ -100,15 +103,25 @@ class SpreadEngine:
             timestamp=int(time.time() * 1000),
         )
 
+    def _can_alert(self, pair_key: str) -> bool:
+        """Check if we can fire another alert within the 5-min window (max N)."""
+        now = time.time()
+        if pair_key not in self._alert_timestamps:
+            self._alert_timestamps[pair_key] = deque()
+        q = self._alert_timestamps[pair_key]
+        # Purge expired entries
+        while q and (now - q[0]) > self._cooldown_seconds:
+            q.popleft()
+        return len(q) < self._max_per_window
+
     async def _trigger_alert(self, symbol: str, exchange_a: str, exchange_b: str,
                              spread_pct: Decimal, direction: str):
-        pair_key = f"{symbol}:{exchange_a}:{exchange_b}"
-        now = time.time()
-        last = self._last_alert_time.get(pair_key, 0)
-        if now - last < self._cooldown_seconds:
+        pair_key = f"{symbol}:{exchange_a}:{exchange_b}:{direction}"
+        if not self._can_alert(pair_key):
             return
 
-        self._last_alert_time[pair_key] = now
+        now = time.time()
+        self._alert_timestamps[pair_key].append(now)
         ts = int(now * 1000)
 
         alert_event = SpreadAlertEvent(
@@ -122,7 +135,7 @@ class SpreadEngine:
         await connection_manager.broadcast(alert_event)
         logger.warning(
             f"SPREAD ALERT: {symbol} {exchange_a}/{exchange_b} spread={spread_pct:.4f}% "
-            f"direction={direction} (cooldown {self._cooldown_seconds}s)"
+            f"direction={direction} ({len(self._alert_timestamps[pair_key])}/{self._max_per_window} in window)"
         )
 
         try:

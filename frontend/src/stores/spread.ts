@@ -3,6 +3,8 @@ import { shallowRef, triggerRef } from 'vue'
 import type { SpreadMatrix, SpreadAlertEvent } from '../types/market'
 
 export interface CellState {
+  exchange_a: string
+  exchange_b: string
   spread_pct: number
   spread_ab: number
   spread_ba: number
@@ -10,13 +12,14 @@ export interface CellState {
 }
 
 export const useSpreadStore = defineStore('spread', () => {
-  // Per-cell Map: key = "exA:exB", only triggers when a cell's value actually changes
-  const cellMap = shallowRef<Map<string, CellState>>(new Map())
+  // Fixed-length array: only triggers re-render on cells whose values changed
+  const cells = shallowRef<CellState[]>([])
+  const cellCount = shallowRef(0)
   const exchanges = shallowRef<string[]>([])
   const staleExchanges = shallowRef<string[]>([])
   const lastTimestamp = shallowRef(0)
 
-  // Alert queue: throttled to show at most 1 every 2 seconds
+  // Alert queue: shows each alert popup, max 3 within 5min per type
   const visibleAlert = shallowRef<SpreadAlertEvent | null>(null)
   const alertHistory = shallowRef<SpreadAlertEvent[]>([])
   let alertQueue: SpreadAlertEvent[] = []
@@ -38,53 +41,62 @@ export const useSpreadStore = defineStore('spread', () => {
     const incoming = pendingMatrix
     pendingMatrix = null
 
-    // Update exchanges list only if changed
     const newExchanges = incoming.exchanges
-    if (JSON.stringify(exchanges.value) !== JSON.stringify(newExchanges)) {
+    if (exchanges.value.length !== newExchanges.length ||
+        exchanges.value.some((e, i) => e !== newExchanges[i])) {
       exchanges.value = newExchanges
     }
 
-    // Update stale list only if changed
     const newStale = incoming.stale_exchanges
-    if (JSON.stringify(staleExchanges.value) !== JSON.stringify(newStale)) {
+    if (staleExchanges.value.length !== newStale.length ||
+        staleExchanges.value.some((e, i) => e !== newStale[i])) {
       staleExchanges.value = newStale
     }
 
     lastTimestamp.value = incoming.timestamp
 
-    // Diff cells: only update Map entries that actually changed
-    const prev = cellMap.value
+    // Fixed-length array diff: only mutate slots where value changed
+    const prev = cells.value
+    const incomingCells = incoming.cells
     let changed = false
-    const seen = new Set<string>()
 
-    for (const cell of incoming.cells) {
-      const key = `${cell.exchange_a}:${cell.exchange_b}`
-      seen.add(key)
-      const existing = prev.get(key)
-      if (!existing ||
-          existing.spread_pct !== cell.spread_pct ||
-          existing.spread_ab !== cell.spread_ab ||
-          existing.spread_ba !== cell.spread_ba) {
-        prev.set(key, {
-          spread_pct: cell.spread_pct,
-          spread_ab: cell.spread_ab,
-          spread_ba: cell.spread_ba,
-          best_spread: cell.best_spread,
-        })
-        changed = true
-      }
+    // Resize if needed
+    if (prev.length !== incomingCells.length) {
+      cells.value = incomingCells.map(c => ({
+        exchange_a: c.exchange_a,
+        exchange_b: c.exchange_b,
+        spread_pct: c.spread_pct,
+        spread_ab: c.spread_ab,
+        spread_ba: c.spread_ba,
+        best_spread: c.best_spread,
+      }))
+      cellCount.value = incomingCells.length
+      triggerRef(cells)
+      return
     }
 
-    // Remove cells no longer present
-    for (const key of prev.keys()) {
-      if (!seen.has(key)) {
-        prev.delete(key)
+    for (let i = 0; i < incomingCells.length; i++) {
+      const n = incomingCells[i]
+      const p = prev[i]
+      if (p.spread_pct !== n.spread_pct ||
+          p.spread_ab !== n.spread_ab ||
+          p.spread_ba !== n.spread_ba ||
+          p.exchange_a !== n.exchange_a ||
+          p.exchange_b !== n.exchange_b) {
+        prev[i] = {
+          exchange_a: n.exchange_a,
+          exchange_b: n.exchange_b,
+          spread_pct: n.spread_pct,
+          spread_ab: n.spread_ab,
+          spread_ba: n.spread_ba,
+          best_spread: n.best_spread,
+        }
         changed = true
       }
     }
 
     if (changed) {
-      triggerRef(cellMap)
+      triggerRef(cells)
     }
   }
 
@@ -106,9 +118,9 @@ export const useSpreadStore = defineStore('spread', () => {
       return
     }
     visibleAlert.value = next
+    // Show for 2s, then gap 500ms before next
     alertTimer = window.setTimeout(() => {
       visibleAlert.value = null
-      // Wait 2 seconds before showing next
       alertTimer = window.setTimeout(() => {
         alertTimer = null
         if (alertQueue.length > 0) {
@@ -132,11 +144,19 @@ export const useSpreadStore = defineStore('spread', () => {
   }
 
   function getCell(exA: string, exB: string): CellState | undefined {
-    return cellMap.value.get(`${exA}:${exB}`) || cellMap.value.get(`${exB}:${exA}`)
+    const arr = cells.value
+    for (let i = 0; i < arr.length; i++) {
+      const c = arr[i]
+      if ((c.exchange_a === exA && c.exchange_b === exB) ||
+          (c.exchange_a === exB && c.exchange_b === exA)) {
+        return c
+      }
+    }
+    return undefined
   }
 
   return {
-    cellMap, exchanges, staleExchanges, lastTimestamp,
+    cells, cellCount, exchanges, staleExchanges, lastTimestamp,
     visibleAlert, alertHistory,
     handleSpreadMatrix, handleAlert, dismissAlert, getCell,
   }

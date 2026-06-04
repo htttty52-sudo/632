@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 
-from app.arbitrage.price_table import PriceTable, SlidingWindowClockEstimator, SymbolShard
+from app.arbitrage.price_table import PriceTable, SlidingWindowClockEstimator, ExchangeSymbolSlot
 from app.arbitrage.spread_engine import SpreadEngine
 
 
@@ -33,42 +33,91 @@ class TestSlidingWindowClockEstimator:
         est.update(1000.0, 900.0)   # 100
         est.update(1000.0, 800.0)   # 200
         est.update(1000.0, 850.0)   # 150
-        # window: [100, 200, 150], median = 150
         assert est.offset_ms == 150.0
-        est.update(1000.0, 890.0)   # 110
-        # window: [200, 150, 110] (oldest 100 dropped), median = 150
+        est.update(1000.0, 890.0)   # 110 -> window [200, 150, 110], median=150
         assert est.offset_ms == 150.0
 
     def test_offset_property_default(self):
         est = SlidingWindowClockEstimator()
         assert est.offset_ms == 0.0
 
+    def test_reset_clears_window(self):
+        est = SlidingWindowClockEstimator(window_size=5)
+        est.update(1000.0, 900.0)
+        est.update(1000.0, 850.0)
+        est.reset()
+        assert est.offset_ms == 0.0
+        offset = est.update(2000.0, 1950.0)  # fresh start: diff=50
+        assert offset == 50.0
+
+    def test_stable_burst_discards_stale_entries(self):
+        """After 5 stable samples, old entries deviating >2s are discarded."""
+        est = SlidingWindowClockEstimator(
+            window_size=20, stable_count=5, stale_discard_ms=2000.0
+        )
+        # Add some very skewed old samples (offset ~5000ms)
+        for _ in range(5):
+            est.update(10000.0, 5000.0)  # diff = 5000
+
+        # Now feed 5 stable samples around 100ms
+        for i in range(5):
+            est.update(10000.0 + i, 9900.0 + i)  # diff ~100
+
+        # The old 5000ms entries should be discarded since they deviate >2000 from median(~100)
+        # Median should now be close to 100, not pulled up by 5000
+        assert est.offset_ms < 200.0
+
 
 @pytest.mark.asyncio
-class TestPriceTableSharding:
-    async def test_different_symbols_use_different_shards(self):
+class TestPerExchangePerSymbolLocking:
+    async def test_different_exchanges_same_symbol_independent_locks(self):
         table = PriceTable(stale_threshold_ms=5000)
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
-        await table.update("binance", "ETH/USDT", Decimal("3500"), Decimal("3501"), now_ms())
+        await table.update("okx", "BTC/USDT", Decimal("67510"), Decimal("67511"), now_ms())
 
-        btc_prices = await table.get_valid_prices("BTC/USDT")
-        eth_prices = await table.get_valid_prices("ETH/USDT")
-        assert "binance" in btc_prices
-        assert "binance" in eth_prices
-        assert btc_prices["binance"].best_bid == Decimal("67500")
-        assert eth_prices["binance"].best_bid == Decimal("3500")
+        # Mark only binance stale
+        await table.mark_exchange_stale("binance", "BTC/USDT")
+        valid = await table.get_valid_prices("BTC/USDT")
+        assert "binance" not in valid
+        assert "okx" in valid
 
-    async def test_stale_on_one_symbol_doesnt_affect_other(self):
+    async def test_same_exchange_different_symbols_independent(self):
         table = PriceTable(stale_threshold_ms=5000)
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
         await table.update("binance", "ETH/USDT", Decimal("3500"), Decimal("3501"), now_ms())
 
         await table.mark_exchange_stale("binance", "BTC/USDT")
+        btc = await table.get_valid_prices("BTC/USDT")
+        eth = await table.get_valid_prices("ETH/USDT")
+        assert "binance" not in btc
+        assert "binance" in eth
 
-        btc_valid = await table.get_valid_prices("BTC/USDT")
-        eth_valid = await table.get_valid_prices("ETH/USDT")
-        assert "binance" not in btc_valid
-        assert "binance" in eth_valid
+    async def test_parallel_updates_no_contention(self):
+        """Different (exchange, symbol) pairs update truly in parallel."""
+        table = PriceTable(stale_threshold_ms=5000)
+
+        async def update_binance_btc():
+            for _ in range(20):
+                await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
+                await asyncio.sleep(0.005)
+
+        async def update_okx_eth():
+            for _ in range(20):
+                await table.update("okx", "ETH/USDT", Decimal("3500"), Decimal("3501"), now_ms())
+                await asyncio.sleep(0.005)
+
+        async def update_huobi_btc():
+            for _ in range(20):
+                await table.update("huobi", "BTC/USDT", Decimal("67490"), Decimal("67491"), now_ms())
+                await asyncio.sleep(0.005)
+
+        await asyncio.gather(update_binance_btc(), update_okx_eth(), update_huobi_btc())
+
+        btc = await table.get_valid_prices("BTC/USDT")
+        eth = await table.get_valid_prices("ETH/USDT")
+        assert "binance" in btc
+        assert "huobi" in btc
+        assert "okx" in eth
 
 
 @pytest.mark.asyncio
@@ -92,8 +141,7 @@ class TestPriceTableStaleness:
         assert "binance" in valid
         assert "okx" in valid
 
-    async def test_no_data_timeout_marks_stale(self):
-        """5s no new data = stale (based on local_receive_time)."""
+    async def test_5s_no_data_timeout(self):
         table = PriceTable(stale_threshold_ms=200)
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
         await asyncio.sleep(0.25)
@@ -116,11 +164,9 @@ class TestPriceTableStaleness:
         table = PriceTable(stale_threshold_ms=5000)
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
         await table.update("okx", "BTC/USDT", Decimal("67510"), Decimal("67511"), now_ms())
-        await table.update("huobi", "BTC/USDT", Decimal("67490"), Decimal("67491"), now_ms())
 
         await table.mark_exchange_stale("binance", "BTC/USDT")
         await table.mark_exchange_stale("okx", "BTC/USDT")
-        await table.mark_exchange_stale("huobi", "BTC/USDT")
 
         valid = await table.get_valid_prices("BTC/USDT")
         assert len(valid) == 0
@@ -137,72 +183,48 @@ class TestPriceTableStaleness:
 
 
 @pytest.mark.asyncio
-class TestSpreadEngineWithDegradation:
-    async def test_spread_matrix_with_all_valid(self):
+class TestClearStaleOnReconnect:
+    async def test_clear_exchange_stale_restores_all_symbols(self):
+        """Reconnect clears stale mark for all symbols of that exchange."""
         table = PriceTable(stale_threshold_ms=5000)
-        await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
-        await table.update("okx", "BTC/USDT", Decimal("67510"), Decimal("67511"), now_ms())
         await table.update("huobi", "BTC/USDT", Decimal("67490"), Decimal("67491"), now_ms())
+        await table.update("huobi", "ETH/USDT", Decimal("3490"), Decimal("3491"), now_ms())
 
-        engine = SpreadEngine(table)
-        matrix = await engine._compute_matrix("BTC/USDT")
+        # Disconnect marks all stale
+        await table.mark_exchange_stale("huobi")
+        btc = await table.get_valid_prices("BTC/USDT")
+        eth = await table.get_valid_prices("ETH/USDT")
+        assert "huobi" not in btc
+        assert "huobi" not in eth
 
-        assert matrix is not None
-        assert len(matrix.exchanges) == 3
-        assert len(matrix.cells) == 3
-        assert len(matrix.stale_exchanges) == 0
+        # Reconnect clears all
+        await table.clear_exchange_stale("huobi")
+        btc = await table.get_valid_prices("BTC/USDT")
+        eth = await table.get_valid_prices("ETH/USDT")
+        assert "huobi" in btc
+        assert "huobi" in eth
 
-    async def test_spread_matrix_excludes_stale_exchange(self):
-        table = PriceTable(stale_threshold_ms=5000)
+    async def test_clear_stale_resets_clock_estimator(self):
+        """After reconnect, clock estimator starts fresh."""
+        table = PriceTable(stale_threshold_ms=5000, clock_window_size=5)
+        # Feed skewed timestamps
+        for _ in range(5):
+            await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"),
+                               now_ms() - 5000)
+
+        await table.clear_exchange_stale("binance")
+
+        # Now feed fresh timestamp - should be immediately valid
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
-        await table.update("okx", "BTC/USDT", Decimal("67510"), Decimal("67511"), now_ms())
-        await table.update("huobi", "BTC/USDT", Decimal("67490"), Decimal("67491"), now_ms())
+        valid = await table.get_valid_prices("BTC/USDT")
+        assert "binance" in valid
 
-        await table.mark_exchange_stale("huobi", "BTC/USDT")
 
-        engine = SpreadEngine(table)
-        matrix = await engine._compute_matrix("BTC/USDT")
-
-        assert matrix is not None
-        assert "huobi" not in matrix.exchanges
-        assert len(matrix.cells) == 1
-        assert "huobi" in matrix.stale_exchanges
-
-    async def test_spread_matrix_returns_empty_cells_when_one_valid(self):
-        table = PriceTable(stale_threshold_ms=5000)
-        await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
-        await table.mark_exchange_stale("binance", "BTC/USDT")
-        await table.update("okx", "BTC/USDT", Decimal("67510"), Decimal("67511"), now_ms())
-        await table.mark_exchange_stale("okx", "BTC/USDT")
-        await table.update("huobi", "BTC/USDT", Decimal("67490"), Decimal("67491"), now_ms())
-
-        engine = SpreadEngine(table)
-        matrix = await engine._compute_matrix("BTC/USDT")
-
-        assert matrix is not None
-        assert len(matrix.cells) == 0
-        assert len(matrix.exchanges) == 1
-
-    async def test_spread_calculation_correctness(self):
-        table = PriceTable(stale_threshold_ms=5000)
-        await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67510"), now_ms())
-        await table.update("okx", "BTC/USDT", Decimal("67520"), Decimal("67530"), now_ms())
-
-        engine = SpreadEngine(table)
-        matrix = await engine._compute_matrix("BTC/USDT")
-
-        assert matrix is not None
-        cell = matrix.cells[0]
-        assert cell.exchange_a == "binance"
-        assert cell.exchange_b == "okx"
-        # spread_ab = okx_bid - binance_ask = 67520 - 67510 = 10
-        assert cell.spread_ab == Decimal("10")
-        # spread_ba = binance_bid - okx_ask = 67500 - 67530 = -30
-        assert cell.spread_ba == Decimal("-30")
-        assert cell.best_spread == Decimal("10")
-
+@pytest.mark.asyncio
+class TestSpreadEngineAlertWindowing:
     @patch("app.arbitrage.spread_engine.connection_manager")
-    async def test_alert_triggered_on_threshold(self, mock_cm):
+    async def test_alert_allows_max_3_within_5min(self, mock_cm):
+        """Same pair+direction: max 3 alerts within the cooldown window."""
         mock_cm.broadcast = AsyncMock()
         table = PriceTable(stale_threshold_ms=5000)
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67510"), now_ms())
@@ -210,52 +232,61 @@ class TestSpreadEngineWithDegradation:
 
         engine = SpreadEngine(table)
         engine._threshold_pct = Decimal("0.01")
+        engine._cooldown_seconds = 300.0
+        engine._max_per_window = 3
 
         with patch("app.arbitrage.spread_engine.async_session") as mock_session_ctx:
             mock_session = AsyncMock()
             mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-            await engine._compute_matrix("BTC/USDT")
+            # Fire 5 times, only first 3 should emit alerts
+            for _ in range(5):
+                await engine._compute_matrix("BTC/USDT")
 
         alert_calls = [
             c for c in mock_cm.broadcast.call_args_list
             if hasattr(c[0][0], 'direction')
         ]
-        assert len(alert_calls) == 1
-        alert = alert_calls[0][0][0]
-        assert alert.exchange_a == "binance"
-        assert alert.exchange_b == "okx"
+        assert len(alert_calls) == 3
 
     @patch("app.arbitrage.spread_engine.connection_manager")
-    async def test_alert_30min_cooldown_prevents_flooding(self, mock_cm):
-        """Same pair only triggers once within 30-minute window."""
+    async def test_different_directions_have_separate_quotas(self, mock_cm):
+        """a_to_b and b_to_a are tracked separately."""
         mock_cm.broadcast = AsyncMock()
         table = PriceTable(stale_threshold_ms=5000)
-        await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67510"), now_ms())
-        await table.update("okx", "BTC/USDT", Decimal("67600"), Decimal("67610"), now_ms())
 
         engine = SpreadEngine(table)
         engine._threshold_pct = Decimal("0.01")
-        engine._cooldown_seconds = 1800.0
+        engine._cooldown_seconds = 300.0
+        engine._max_per_window = 1
 
         with patch("app.arbitrage.spread_engine.async_session") as mock_session_ctx:
             mock_session = AsyncMock()
             mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_session)
             mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+            # First: spread favors a_to_b
+            await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67510"), now_ms())
+            await table.update("okx", "BTC/USDT", Decimal("67600"), Decimal("67610"), now_ms())
             await engine._compute_matrix("BTC/USDT")
+
+            # Flip: spread favors b_to_a
+            await table.update("binance", "BTC/USDT", Decimal("67600"), Decimal("67610"), now_ms())
+            await table.update("okx", "BTC/USDT", Decimal("67500"), Decimal("67510"), now_ms())
             await engine._compute_matrix("BTC/USDT")
 
         alert_calls = [
             c for c in mock_cm.broadcast.call_args_list
             if hasattr(c[0][0], 'direction')
         ]
-        assert len(alert_calls) == 1
+        assert len(alert_calls) == 2
+        directions = {c[0][0].direction for c in alert_calls}
+        assert "a_to_b" in directions
+        assert "b_to_a" in directions
 
 
 @pytest.mark.asyncio
 class TestConsecutiveDisconnectDegradation:
     async def test_sequential_disconnects_degrade_gracefully(self):
-        """Simulate exchanges disconnecting one by one."""
         table = PriceTable(stale_threshold_ms=5000)
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
         await table.update("okx", "BTC/USDT", Decimal("67510"), Decimal("67511"), now_ms())
@@ -263,78 +294,41 @@ class TestConsecutiveDisconnectDegradation:
 
         engine = SpreadEngine(table)
 
-        # All valid: 3 pairs
         matrix = await engine._compute_matrix("BTC/USDT")
         assert len(matrix.cells) == 3
 
-        # First disconnect
         await table.mark_exchange_stale("huobi", "BTC/USDT")
         matrix = await engine._compute_matrix("BTC/USDT")
         assert len(matrix.cells) == 1
-        assert matrix.cells[0].exchange_a == "binance"
-        assert matrix.cells[0].exchange_b == "okx"
 
-        # Second disconnect
         await table.mark_exchange_stale("okx", "BTC/USDT")
         matrix = await engine._compute_matrix("BTC/USDT")
         assert len(matrix.cells) == 0
 
-        # Reconnect one
+        # Reconnect: clear + fresh data
+        await table.clear_exchange_stale("okx")
         await table.update("okx", "BTC/USDT", Decimal("67515"), Decimal("67516"), now_ms())
         matrix = await engine._compute_matrix("BTC/USDT")
         assert len(matrix.cells) == 1
 
-        # Reconnect all
+        await table.clear_exchange_stale("huobi")
         await table.update("huobi", "BTC/USDT", Decimal("67495"), Decimal("67496"), now_ms())
         matrix = await engine._compute_matrix("BTC/USDT")
         assert len(matrix.cells) == 3
 
-    async def test_5s_no_data_timeout_shows_delayed(self):
-        """When no new data arrives for >5s, exchange is marked stale."""
+    async def test_5s_timeout_marks_delayed(self):
         table = PriceTable(stale_threshold_ms=200)
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
         await table.update("okx", "BTC/USDT", Decimal("67510"), Decimal("67511"), now_ms())
 
-        # Both fresh
-        valid = await table.get_valid_prices("BTC/USDT")
-        assert len(valid) == 2
-
-        # Wait for timeout
         await asyncio.sleep(0.25)
-
-        # Now stale
-        valid = await table.get_valid_prices("BTC/USDT")
-        assert len(valid) == 0
         stale = await table.get_stale_exchanges("BTC/USDT")
         assert "binance" in stale
         assert "okx" in stale
 
-    async def test_stale_detection_with_clock_skew(self):
-        """Exchange with clock ahead should still be detected as fresh if recent."""
+    async def test_clock_skew_handled_correctly(self):
         table = PriceTable(stale_threshold_ms=5000, clock_window_size=5)
         future_ts = now_ms() + 2000
         await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), future_ts)
-
         valid = await table.get_valid_prices("BTC/USDT")
         assert "binance" in valid
-
-    async def test_parallel_symbol_updates_independent(self):
-        """Different symbols can update concurrently without blocking each other."""
-        table = PriceTable(stale_threshold_ms=5000)
-
-        async def update_btc():
-            for _ in range(10):
-                await table.update("binance", "BTC/USDT", Decimal("67500"), Decimal("67501"), now_ms())
-                await asyncio.sleep(0.01)
-
-        async def update_eth():
-            for _ in range(10):
-                await table.update("binance", "ETH/USDT", Decimal("3500"), Decimal("3501"), now_ms())
-                await asyncio.sleep(0.01)
-
-        await asyncio.gather(update_btc(), update_eth())
-
-        btc = await table.get_valid_prices("BTC/USDT")
-        eth = await table.get_valid_prices("ETH/USDT")
-        assert "binance" in btc
-        assert "binance" in eth

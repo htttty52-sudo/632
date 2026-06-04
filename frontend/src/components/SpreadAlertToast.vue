@@ -10,8 +10,8 @@
             <div class="flex items-center gap-1 mb-1">
               <span class="w-2 h-2 rounded-full bg-red-400 animate-pulse"></span>
               <span class="text-xs font-semibold text-red-300">SPREAD ALERT</span>
-              <span v-if="queueCount > 0" class="text-xs text-gray-400 ml-2">
-                +{{ queueCount }} queued
+              <span v-if="store.alertHistory.length > 1" class="text-xs text-gray-400 ml-2">
+                ({{ store.alertHistory.length }} total)
               </span>
             </div>
             <p class="text-sm text-white">
@@ -38,14 +38,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
 import { useSpreadStore } from '../stores/spread'
 
 const store = useSpreadStore()
-
-const queueCount = computed(() => {
-  return Math.max(0, store.alertHistory.length - 1)
-})
 
 function formatExchange(name: string): string {
   return name.replace(/^mock_/, '')

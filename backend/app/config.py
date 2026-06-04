@@ -25,9 +25,12 @@ class Settings(BaseSettings):
 
     stale_threshold_ms: float = 5000.0
     clock_window_size: int = 20
+    clock_stable_count: int = 5
+    clock_stale_discard_ms: float = 2000.0
     spread_broadcast_interval_ms: float = 500.0
     spread_alert_threshold_pct: float = 0.1
-    spread_alert_cooldown_seconds: float = 1800.0
+    spread_alert_cooldown_seconds: float = 300.0
+    spread_alert_max_per_window: int = 3
 
     use_mock: bool = False
 
